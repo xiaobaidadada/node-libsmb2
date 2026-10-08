@@ -1,0 +1,48 @@
+{
+  "name": "node-libsmb2",
+  "version": "1.0.0",
+  "description": "Node.js N-API binding for libsmb2 — SMB2/3 client built from the bundled C library at install time",
+  "main": "js/index.js",
+  "types": "js/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:xiaobaidadada/node-libsmb2.git"
+  },
+  "scripts": {
+    "preinstall": "node scripts/gen_config.js",
+    "install": "node-gyp rebuild --release",
+    "rebuild": "node scripts/gen_config.js && node-gyp rebuild",
+    "configure": "node scripts/gen_config.js && node-gyp configure",
+    "test": "node test/basic.test.js"
+  },
+  "keywords": [
+    "smb",
+    "smb2",
+    "smb3",
+    "cifs",
+    "libsmb2",
+    "napi",
+    "network-share"
+  ],
+  "author": "xiaobaidadada",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "js",
+    "src",
+    "scripts",
+    "c-libsmb2/include",
+    "c-libsmb2/lib",
+    "c-libsmb2/COPYING",
+    "c-libsmb2/LICENCE-LGPL-2.1.txt",
+    "binding.gyp",
+    "README.md"
+  ],
+  "gypfile": true,
+  "dependencies": {
+    "node-addon-api": "^8.5.0",
+    "node-gyp": "^11.4.2"
+  }
+}

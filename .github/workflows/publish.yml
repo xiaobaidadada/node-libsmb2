@@ -1,0 +1,21 @@
+name: "发布到 NPM"
+run-name: 分支:${{ github.ref_name }} ; 版本:${{ github.ref_name }}
+
+# 本包不走 prebuild-install：安装时由 node-gyp 现场编译（见 package.json 的 install 脚本），
+# 所以这里不预先构建任何平台，只负责把源码推到 npm。
+on:
+  workflow_dispatch: # 手动触发
+
+jobs:
+  publish-npm:
+    name: Publishing to NPM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          registry-url: https://registry.npmjs.org
+      - run: npm publish --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,161 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
+/*
+   Copyright (C) 2026 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "smb2.h"
+#include "libsmb2.h"
+#include "libsmb2-raw.h"
+
+int usage(void)
+{
+        fprintf(stderr, "Usage:\n"
+                "smb2-share-enum-sync [-l level] <smb2-url>\n\n"
+                "URL format: "
+                "smb://[<domain;][<username>@]<host>[:<port>]/\n");
+        exit(1);
+}
+
+static void print_share_type(uint32_t type)
+{
+        if ((type & 3) == SMB2_SHARE_TYPE_DISKTREE) {
+                printf(" DISKTREE");
+        }
+        if ((type & 3) == SMB2_SHARE_TYPE_PRINTQ) {
+                printf(" PRINTQ");
+        }
+        if ((type & 3) == SMB2_SHARE_TYPE_DEVICE) {
+                printf(" DEVICE");
+        }
+        if ((type & 3) == SMB2_SHARE_TYPE_IPC) {
+                printf(" IPC");
+        }
+        if (type & SMB2_SHARE_TYPE_TEMPORARY) {
+                printf(" TEMPORARY");
+        }
+        if (type & SMB2_SHARE_TYPE_HIDDEN) {
+                printf(" HIDDEN");
+        }
+}
+
+void print_shares(struct smb2_share_enum_reply *rep)
+{
+        uint32_t i;
+
+        printf("Number of shares:%d\n", rep->entries_read);
+        for (i = 0; i < rep->entries_read; i++) {
+                switch (rep->level) {
+                case SMB2_SHARE_INFO_0:
+                        printf("%-20s\n", rep->share_info.info_0[i].netname);
+                        break;
+                case SMB2_SHARE_INFO_1:
+                        printf("%-20s %-20s", rep->share_info.info_1[i].netname,
+                               rep->share_info.info_1[i].remark);
+                        print_share_type(rep->share_info.info_1[i].type);
+                        printf("\n");
+                        break;
+                case SMB2_SHARE_INFO_2:
+                        printf("%-20s %-20s", rep->share_info.info_2[i].netname,
+                               rep->share_info.info_2[i].remark);
+                        print_share_type(rep->share_info.info_2[i].type);
+                        printf(" %s\n", rep->share_info.info_2[i].path ?
+                               rep->share_info.info_2[i].path : "");
+                        break;
+                }
+        }
+}
+
+
+int main(int argc, char *argv[])
+{
+        struct smb2_share_enum_reply *rep;
+        struct smb2_context *smb2;
+        struct smb2_url *url;
+        int opt, level = SMB2_SHARE_INFO_0;
+
+        while ((opt = getopt(argc, argv, "l:")) != -1) {
+                switch (opt) {
+                case 'l':
+                        level = atoi(optarg);
+                        break;
+                default: /* '?' */
+                        usage();
+                }
+        }
+
+        if (optind >= argc) {
+                usage();
+        }
+
+	smb2 = smb2_init_context();
+        if (smb2 == NULL) {
+                fprintf(stderr, "Failed to init context\n");
+                exit(0);
+        }
+
+        switch (level) {
+        case SMB2_SHARE_INFO_0:
+        case SMB2_SHARE_INFO_1:
+        case SMB2_SHARE_INFO_2:
+                break;
+        default:
+                fprintf(stderr, "level must be 0/1/2\n");
+                exit(0);
+        }
+
+        url = smb2_parse_url(smb2, argv[optind]);
+        if (url == NULL) {
+                fprintf(stderr, "Failed to parse url: %s\n",
+                        smb2_get_error(smb2));
+                exit(0);
+        }
+        if (url->user) {
+                smb2_set_user(smb2, url->user);
+        }
+        if (url->domain) {
+                smb2_set_domain(smb2, url->domain);
+        }
+
+        smb2_set_security_mode(smb2, SMB2_NEGOTIATE_SIGNING_ENABLED);
+
+        if (smb2_connect_share(smb2, url->server, "IPC$", NULL) < 0) {
+		printf("Failed to connect to IPC$. %s\n",
+                       smb2_get_error(smb2));
+		exit(10);
+        }
+
+	rep = smb2_share_enum_sync(smb2, level);
+        if (rep == NULL) {
+		printf("ShareEnum failed. %s\n",
+                       smb2_get_error(smb2));
+		exit(10);
+        }
+        print_shares(rep);
+        smb2_free_data(smb2, rep);
+
+        smb2_disconnect_share(smb2);
+        smb2_destroy_url(url);
+        smb2_destroy_context(smb2);
+        
+	return 0;
+}
