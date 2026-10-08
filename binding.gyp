@@ -8,7 +8,7 @@
         "<!@(node -p \"require('fs').readdirSync('c-libsmb2/lib').filter(f=>f.endsWith('.c')).map(f=>'c-libsmb2/lib/'+f).join(' ')\")"
       ],
       "include_dirs": [
-        "<!@(node -p \"require('node-addon-api').include_dir\")",
+        "node_modules/node-addon-api",
         "c-libsmb2/include",
         "c-libsmb2/include/smb2",
         "c-libsmb2/lib",
@@ -23,13 +23,20 @@
           "OS==\"win\"",
           {
             "defines": [
+              "_WINDOWS",
               "_U_=",
               "_CRT_SECURE_NO_WARNINGS",
               "WIN32_LEAN_AND_MEAN"
             ],
+            "libraries": [
+              "-lws2_32.lib"
+            ],
             "msvs_settings": {
               "VCCLCompilerTool": {
                 "ExceptionHandling": 0,
+                "AdditionalOptions": [
+                  "/utf-8"
+                ],
                 "DisableSpecificWarnings": [
                   "4100",
                   "4127",

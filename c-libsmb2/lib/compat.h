@@ -245,7 +245,7 @@ ssize_t readv(t_socket fd, const struct iovec* vector, int count);
 
 #else
 
-inline int writev(t_socket sock, struct iovec *iov, int nvecs)
+static inline int writev(t_socket sock, struct iovec *iov, int nvecs)
 {
   DWORD ret;
 
@@ -257,7 +257,7 @@ inline int writev(t_socket sock, struct iovec *iov, int nvecs)
   return -1;
 }
 
-inline int readv(t_socket sock, struct iovec *iov, int nvecs)
+static inline int readv(t_socket sock, struct iovec *iov, int nvecs)
 {
   DWORD ret;
   DWORD flags = 0;
@@ -870,6 +870,31 @@ int getlogin_r(char *buf, size_t size);
 #ifndef O_ACCMODE
 #define O_ACCMODE (O_RDWR|O_WRONLY|O_RDONLY)
 #endif /* !O_ACCMODE */
+
+/*
+ * MSVC only provides the underscore-prefixed spellings of these flags
+ * (_O_CREAT, _O_EXCL, ...) in <fcntl.h>; the POSIX names that libsmb2
+ * uses are missing. Provide them with the standard POSIX values so the
+ * open()-flag handling in libsmb2.c compiles on MSVC as well as MinGW.
+ */
+#ifndef O_CREAT
+#define O_CREAT		00000100
+#endif
+#ifndef O_EXCL
+#define O_EXCL		00000200
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC		00001000
+#endif
+#ifndef O_APPEND
+#define O_APPEND	00002000
+#endif
+#ifndef O_NONBLOCK
+#define O_NONBLOCK	00004000
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY	00200000
+#endif
 
 #ifndef ENOMEM
 #define ENOMEM 12

@@ -25,6 +25,15 @@
 #ifdef _WINDOWS
 #define login_num ENXIO
 #define getpid_num() GetCurrentProcessId()
+/*
+ * MSVC has no random()/srandom()/getlogin_r(); enable the portable
+ * implementations further down in this file (NEED_RANDOM, NEED_SRANDOM,
+ * NEED_GETLOGIN_R, and NEED_GETPID since random() seeds via getpid()).
+ */
+#define NEED_RANDOM
+#define NEED_SRANDOM
+#define NEED_GETLOGIN_R
+#define NEED_GETPID
 #else
 #define login_num 0
 #define getpid_num() 0	
