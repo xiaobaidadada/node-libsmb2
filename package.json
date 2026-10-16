@@ -1,6 +1,6 @@
 {
   "name": "node-libsmb2",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Node.js N-API binding for libsmb2 — SMB2/3 client built from the bundled C library at install time",
   "main": "js/index.js",
   "types": "js/index.d.ts",
