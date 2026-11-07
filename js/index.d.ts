@@ -92,6 +92,58 @@ export interface Smb2WriteOptions {
   offset?: number | bigint;
 }
 
+/**
+ * 服务端配置 | Server options
+ *
+ * 注意：底层 handler 由 C++ 在服务线程同步调用，服务端文件操作使用 fs 同步 API，
+ * 这是协议层的硬性约束（返回值要立刻填进 SMB reply），与普通的异步 API 用法不同。
+ *
+ * Note: handlers are invoked synchronously from the C++ service thread, so the
+ * server uses fs sync APIs internally. This is a protocol-level constraint
+ * (the return value must be written into the SMB reply immediately).
+ */
+export interface Smb2ServerOptions {
+  /** 监听端口，1~65535。SMB 默认 445，非 root 环境请用高位端口 | Listen port, 1~65535. SMB uses 445 by default; use a high port when not running as root */
+  port: number;
+  /** 共享根目录的绝对路径，必须已存在 | Absolute path of the share root, must exist */
+  root: string;
+  /** 只读模式，开启后拒绝写入/创建/删除 | Read-only mode, rejects write/create/delete */
+  readonly?: boolean;
+  /** 服务端主机名，默认 "filecat" | Server hostname, defaults to "filecat" */
+  name?: string;
+}
+
+/**
+ * SMB2/3 服务端 — 把本地目录通过 SMB 协议对外提供。
+ *
+ * SMB2/3 server — exposes a local directory over the SMB protocol.
+ *
+ * 与 Smb2Client 的关系：全库共用 libsmb2 的全局状态，同一进程内同时跑客户端和
+ * 服务端会互相干扰，实际使用时建议把服务端放在独立子进程里。
+ *
+ * Relationship with Smb2Client: libsmb2 keeps global state, so running a client
+ * and a server in the same process interferes with each other. In practice the
+ * server should run in a separate child process.
+ */
+export class Smb2Server {
+  constructor();
+
+  /** 服务是否正在运行 | Whether the server is running */
+  readonly is_running: boolean;
+
+  /**
+   * 启动服务。
+   *
+   * 根目录不存在或端口非法时会抛错。
+   *
+   * Start the server. Throws if the root directory is missing or the port is invalid.
+   */
+  start(opts: Smb2ServerOptions): Promise<boolean>;
+
+  /** 停止服务（可重复调用） | Stop the server (safe to call multiple times) */
+  stop(): Promise<boolean>;
+}
+
 export class Smb2Client {
   constructor();
 
