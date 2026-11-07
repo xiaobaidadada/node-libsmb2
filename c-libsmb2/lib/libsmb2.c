@@ -5317,6 +5317,17 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
 
                         /* for each client context ready to read, process that context */
                         for (smb2 = smb2_active_contexts(); smb2; smb2 = smb2->next) {
+                                /* 必须先处理可写：smb2_service() 内部固定「先读后写」，
+                                 * 服务端刚排队好 reply 时如果先读，会把尚未发出的 reply 卡住，
+                                 * 表现为客户端收不到回复后超时断开。
+                                 */
+                                if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && FD_ISSET(smb2_get_fd(smb2), &wfds)) {
+                                        if (smb2_service(smb2, POLLOUT) < 0) {
+                                                smb2_set_error(smb2, "smb2_service (out) failed with : "
+                                                                "%s", smb2_get_error(smb2));
+                                                smb2_close_context(smb2);
+                                        }
+                                }
                                 if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && FD_ISSET(smb2_get_fd(smb2), &rfds)) {
                                         if (smb2_service(smb2, POLLIN) < 0) {
                                                 smb2_set_error(smb2, "smb2_service (in) failed with : "
@@ -5324,13 +5335,6 @@ int smb2_serve_port(struct smb2_server *server, const int max_connections, smb2_
                                                 smb2_close_context(smb2);
                                         }
                                         err = 0;
-                                }
-                                if (SMB2_VALID_SOCKET(smb2_get_fd(smb2)) && FD_ISSET(smb2_get_fd(smb2), &wfds)) {
-                                        if (smb2_service(smb2, POLLOUT) < 0) {
-                                                smb2_set_error(smb2, "smb2_service (out) failed with : "
-                                                                "%s", smb2_get_error(smb2));
-                                                smb2_close_context(smb2);
-                                        }
                                 }
                                 if (!SMB2_VALID_SOCKET(smb2->fd) && ((time(NULL) - now) > (smb2->timeout)))
                                 {

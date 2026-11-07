@@ -640,13 +640,12 @@ read_more_data:
                         if (!(smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
                                 pdu->header.sync.tree_id = smb2->hdr.sync.tree_id;
                         }
-                        /* if the session is properly opened then we could get
-                         * any request from the client, so use the header's command
-                         * not the pdu's command for the rest of input
+                        /* 服务端必须以客户端实际发来的 command 为准。
+                         * 原实现用 "> SMB2_SESSION_SETUP" 判断，把 NEGOTIATE(0) 和
+                         * SESSION_SETUP(1) 排除在外，导致这两类请求被按预分配的 pdu
+                         * 命令解析，尺寸校验失败后直接断开连接。
                          */
-                        if (smb2->hdr.command > SMB2_SESSION_SETUP) {
-                                pdu->header.command = smb2->hdr.command;
-                        }
+                        pdu->header.command = smb2->hdr.command;
                         pdu->header.credit_charge = smb2->hdr.credit_charge;
                         pdu->header.credit_request_response = smb2->hdr.credit_request_response;
                 } else {

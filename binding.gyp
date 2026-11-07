@@ -5,6 +5,7 @@
       "sources": [
         "src/smb2_wrap.cpp",
         "src/workers.cpp",
+        "src/smb2_server.cpp",
         "<!@(node -p \"require('fs').readdirSync('c-libsmb2/lib').filter(f=>f.endsWith('.c')).map(f=>'c-libsmb2/lib/'+f).join(' ')\")"
       ],
       "include_dirs": [

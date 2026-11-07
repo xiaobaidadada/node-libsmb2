@@ -1,5 +1,6 @@
 #include "smb2_wrap.h"
 #include "workers.h"
+#include "smb2_server.h"
 #include <fcntl.h>
 #include <cstring>
 
@@ -303,7 +304,9 @@ Napi::Object Smb2Client::Init(Napi::Env env, Napi::Object exports) {
 }
 
 static Napi::Object InitAll(Napi::Env env, Napi::Object exports) {
-    return Smb2Client::Init(env, exports);
+    Smb2Client::Init(env, exports);
+    Smb2Server::Init(env, exports);
+    return exports;
 }
 
 NODE_API_MODULE(node_smb2, InitAll)

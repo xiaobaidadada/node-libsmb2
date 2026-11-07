@@ -112,8 +112,10 @@ void StatWorker::Run() {
     }
 
     struct smb2_stat_64 st;
+    memset(&st, 0, sizeof(st));
     int rc = smb2_stat(client_->ctx_, path_.c_str(), &st);
-    if (rc == 0) {
+    if (rc == 0 && st.smb2_type != 0) {
+        // 服务端返回了有效 type，直接采用
         result_.exists = true;
         result_.type = st.smb2_type;
         result_.size = st.smb2_size;
@@ -126,13 +128,27 @@ void StatWorker::Run() {
         return;
     }
 
-    // stat 失败但目录能打开，说明是个目录（部分服务器不返回目录 stat）
+    // stat 没给出 type（部分服务端不支持 query_info），只能用试探法。
+    // 先试目录：能列出来就是目录；否则按文件处理。
     struct smb2dir *dir = smb2_opendir(client_->ctx_, path_.c_str());
     if (dir) {
         smb2_closedir(client_->ctx_, dir);
         result_.exists = true;
         result_.type = SMB2_TYPE_DIRECTORY;
         return;
+    }
+
+    struct smb2fh *fh = smb2_open(client_->ctx_, path_.c_str(), O_RDONLY);
+    if (fh) {
+        uint8_t probe[1];
+        int n = smb2_read(client_->ctx_, fh, probe, sizeof(probe));
+        smb2_close(client_->ctx_, fh);
+        if (n >= 0) {
+            result_.exists = true;
+            result_.type = SMB2_TYPE_FILE;
+            result_.size = st.smb2_size;
+            return;
+        }
     }
 
     result_.exists = false;

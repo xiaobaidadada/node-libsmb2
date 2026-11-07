@@ -244,7 +244,14 @@ function join_path(base, name) {
   return base + '/' + name;
 }
 
+const { Smb2Server } = require('./smb_server');
+
 module.exports = {
   Smb2Client,
+  Smb2Server: class extends Smb2Server {
+    constructor() {
+      super(binding);
+    }
+  },
   normalize_path,
 };
