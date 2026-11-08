@@ -21,8 +21,12 @@ class Smb2Server {
   constructor(binding) {
     this._binding = binding;
     this._impl = new binding.Smb2Server();
-    this._root = '/';
+    // 共享名 → { path, readonly }
+    this._shares = new Map();
     this._readonly = false;
+    // 服务级账号：SMB 认证在 session 阶段，此时还没有共享上下文
+    this._username = '';
+    this._password = '';
     // 已列出过内容的目录句柄，避免客户端无限翻页
     this._listed_handles = new Set();
   }
@@ -43,20 +47,55 @@ class Smb2Server {
     if (!opts || typeof opts !== 'object') {
       throw new Error('start 需要传入配置对象');
     }
-    const root = path.resolve(opts.root || '');
-    if (!fs.existsSync(root)) {
-      throw new Error(`根目录不存在: ${root}`);
+    if (!Array.isArray(opts.shares) || opts.shares.length === 0) {
+      throw new Error('shares 不能为空');
     }
-    this._root = root;
+
+    this._shares.clear();
+    const shares = [];
+    for (const s of opts.shares) {
+      const name = String(s.name || '');
+      if (!name) {
+        throw new Error('共享名不能为空');
+      }
+      if (this._shares.has(name)) {
+        throw new Error(`共享名重复: ${name}`);
+      }
+      const share_path = path.resolve(s.path || '');
+      if (!fs.existsSync(share_path)) {
+        throw new Error(`共享目录不存在: ${name} -> ${share_path}`);
+      }
+      this._shares.set(name, {
+        path: share_path,
+        readonly: Boolean(s.readonly),
+      });
+      shares.push({ name, path: share_path, remark: s.remark || 'FileCat' });
+    }
+
     this._readonly = Boolean(opts.readonly);
+    this._username = opts.username ? String(opts.username) : '';
+    this._password = opts.password ? String(opts.password) : '';
 
     return this._impl.start({
       port: opts.port,
-      root,
-      readonly: this._readonly,
       name: opts.name || 'filecat',
+      // 共享列表：每条一行 "name\tpath\tremark"，供 NetrShareEnum 枚举与 tree_connect 定位
+      shares: shares.map((x) => `${x.name}\t${x.path}\t${x.remark || ''}`).join('\n'),
+      // 配了账号就需要认证
+      allow_anonymous: !this._password,
       api: this,
     });
+  }
+
+  /** 按共享名取共享配置，不存在时抛错 */
+  _share(name) {
+    const s = this._shares.get(String(name || ''));
+    if (!s) {
+      const e = new Error('no such share');
+      e.smb_status = 0xc00000cc; /* STATUS_BAD_NETWORK_NAME */
+      throw e;
+    }
+    return s;
   }
 
   stop() {
@@ -65,24 +104,44 @@ class Smb2Server {
 
   /* ---------------- 以下方法被 C++ 同步调用 ---------------- */
 
-  /** 把 SMB 相对路径转成真实系统路径，并防止 ../ 逃逸出 root */
-  _resolve(inner_path) {
+  /** 把 SMB 相对路径按指定共享转成真实系统路径，并防止 ../ 逃逸出共享根 */
+  _resolve(share_name, inner_path) {
+    const share = this._share(share_name);
+    const root = share.path;
     const rel = String(inner_path || '').replace(/\\/g, '/').replace(/^\/+/, '');
-    const full = path.resolve(this._root, rel);
-    if (full !== this._root && !full.startsWith(this._root + path.sep)) {
+    const full = path.resolve(root, rel);
+    if (full !== root && !full.startsWith(root + path.sep)) {
       throw new Error('path escape');
     }
     return full;
   }
 
-  authorize() {
-    return true;
+  /** 该共享是否只读（服务级或共享级任一为真） */
+  _share_readonly(share_name) {
+    return this._readonly || this._share(share_name).readonly;
+  }
+
+  authorize(payload) {
+    // SMB 认证发生在 session setup 阶段，此时客户端还没说要访问哪个共享，
+    // 因此账号是服务级的：一套用户名密码管所有共享。
+    // 共享级的差异只体现在「只读」上，由 tree_connect 之后的各操作判断。
+    const user = String(payload.user || '');
+    if (this._username && user !== this._username) {
+      throw new Error('user not found');
+    }
+    if (!this._password) {
+      throw new Error('user not found');
+    }
+    // 返回密码明文，libsmb2 内部用它做 NTLMv2 校验
+    return this._password;
   }
 
   create(payload) {
     let full;
+    let readonly;
     try {
-      full = this._resolve(payload.name);
+      full = this._resolve(payload.share, payload.name);
+      readonly = this._share_readonly(payload.share);
     } catch (e) {
       return { error: -13 /* EACCES */ };
     }
@@ -103,7 +162,7 @@ class Smb2Server {
       if (is_open) {
         return { error: -2 /* ENOENT */ };
       }
-      if (this._readonly) {
+      if (readonly) {
         return { error: -13 };
       }
       try {
@@ -130,16 +189,40 @@ class Smb2Server {
       return { error: -2 /* ENOENT */ };
     }
 
+    // SMB2_FILE_DELETE_ON_CLOSE：客户端 unlink/rmdir 用这种方式删除
+    const delete_on_close = (payload.create_options & 0x1000) !== 0;
+    if (delete_on_close && readonly) {
+      return { error: -13 };
+    }
+
     return {
       is_dir,
       path: full,
       size: st.size,
       create_action: is_open ? 1 : 2,
+      delete_on_close,
     };
   }
 
   close(payload) {
     return null;
+  }
+
+  delete(payload) {
+    if (this._share_readonly(payload.share)) {
+      return { error: -13 };
+    }
+    try {
+      const st = fs.lstatSync(payload.path);
+      if (st.isDirectory()) {
+        fs.rmdirSync(payload.path);
+      } else {
+        fs.unlinkSync(payload.path);
+      }
+      return null;
+    } catch (e) {
+      return { error: -13 };
+    }
   }
 
   read(payload) {
@@ -157,13 +240,41 @@ class Smb2Server {
   }
 
   write(payload) {
-    if (this._readonly) {
+    if (this._share_readonly(payload.share)) {
       return { error: -13 };
     }
     const full = payload.path;
     try {
       const fd = fs.openSync(full, 'r+');
       fs.writeSync(fd, payload.data, 0, payload.data.length, payload.offset);
+      fs.closeSync(fd);
+      return null;
+    } catch (e) {
+      return { error: -13 };
+    }
+  }
+
+  rename(payload) {
+    if (this._share_readonly(payload.share)) {
+      return { error: -13 };
+    }
+    try {
+      const target = this._resolve(payload.share, payload.name);
+      fs.renameSync(payload.path, target);
+      // 回传新的绝对路径，交给 C++ 更新句柄
+      return target;
+    } catch (e) {
+      return { error: -13 };
+    }
+  }
+
+  truncate(payload) {
+    if (this._share_readonly(payload.share)) {
+      return { error: -13 };
+    }
+    try {
+      const fd = fs.openSync(payload.path, "r+");
+      fs.ftruncateSync(fd, payload.offset);
       fs.closeSync(fd);
       return null;
     } catch (e) {

@@ -111,6 +111,10 @@ export interface Smb2ServerOptions {
   readonly?: boolean;
   /** 服务端主机名，默认 "filecat" | Server hostname, defaults to "filecat" */
   name?: string;
+  /** 登录用户名，配置后强制 NTLM 认证；留空则匿名访问 | Login user name; when set, NTLM auth is enforced. Empty means anonymous access */
+  username?: string;
+  /** 登录密码 | Login password */
+  password?: string;
 }
 
 /**
