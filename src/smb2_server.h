@@ -8,11 +8,13 @@
 #include <map>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 
 extern "C" {
 #include "smb2.h"
 #include "libsmb2.h"
+#include "libsmb2-private.h"
 }
 
 /**
@@ -50,6 +52,15 @@ struct Smb2Req {
     uint32_t index = 0;
     uint32_t buffer_length = 0;
 
+    // queryDirectory 的目录项结果：C++ 侧要据此填 smb2_fileidbothdirectoryinformation
+    struct DirEntry {
+        std::string name;
+        uint64_t size = 0;
+        uint64_t mtime = 0;
+        bool is_dir = false;
+    };
+    std::vector<DirEntry> out_entries;
+
     // queryInfo
     uint32_t info_type = 0;
     uint32_t file_info_class = 0;
@@ -63,6 +74,7 @@ struct Smb2Req {
     std::string out_password;   // authorize 返回的密码，空表示匿名
     std::string out_path;
     uint64_t out_size = 0;
+    uint64_t out_mtime = 0;    // queryInfo 返回的修改时间（unix 秒）
     uint32_t out_create_action = 0;
 
     std::string out_bytes;     // read/queryDirectory/queryInfo 的返回字节
@@ -104,7 +116,6 @@ private:
     Napi::ObjectReference api_;
 
     std::mutex ipc_mtx_;
-    std::map<struct smb2_context *, bool> ipc_trees_;
     std::map<uint64_t, std::string> pipe_handles_;
     uint64_t next_pipe_handle_ = 0x8000000000000000ULL;
     std::mutex last_fid_mtx_;
@@ -120,9 +131,15 @@ private:
     // 共享名 -> 目录；有序，枚举时保持配置顺序
     std::vector<std::pair<std::string, std::string>> shares_;
     std::string share_remark_ = "FileCat";
-    // 每连接的 tree 连接到的共享名
+
+    // DCE/RPC 服务端（srvsvc 共享枚举）。非线程安全，全部在服务线程内用。
+    struct dcerpc_server *rpc_ = NULL;
+    std::map<uint64_t, struct dcerpc_server_pipe *> rpc_pipes_;
+    std::mutex rpc_mutex_;
+    // 每个连接当前 tree 对应的共享名
     std::mutex tree_mtx_;
-    std::map<struct smb2_context *, std::string> tree_shares_;
+    std::map<struct smb2_context *, std::string> cur_share_;   // IPC$ 标记
+    std::map<struct smb2_context *, std::string> disk_share_;  // 磁盘共享名
 
 public:
     bool readonly() const { return readonly_; }
@@ -130,47 +147,92 @@ public:
     void set_share_remark(const std::string &n) { share_remark_ = n; }
     const std::string &share_remark() const { return share_remark_; }
 
-    /** 共享名是否存在于配置中 */
+    /** 共享名是否存在于配置中（SMB 共享名大小写不敏感） */
     bool has_share(const std::string &n) const {
+        return !canonical_share(n).empty();
+    }
+
+    /** 按大小写不敏感规则返回配置里的规范共享名，未命中返回空串 */
+    std::string canonical_share(const std::string &n) const {
         for (const auto &it : shares_) {
-            if (it.first == n) {
-                return true;
+            if (it.first.size() != n.size()) {
+                continue;
+            }
+            bool same = true;
+            for (size_t i = 0; i < n.size(); i++) {
+                if (std::tolower((unsigned char)it.first[i]) != std::tolower((unsigned char)n[i])) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                return it.first;
             }
         }
-        return false;
+        return std::string();
     }
 
     const std::vector<std::pair<std::string, std::string>> &shares() const {
         return shares_;
     }
 
-    /** tree_connect 时记录该连接连到了哪个共享 */
-    void set_tree_share(struct smb2_context *ctx, const std::string &n) {
+    /**
+     * tree_connect 时记录共享名。
+     *
+     * libsmb2 服务端不会把请求的 tree_id 填进 smb2_context
+     * （hdr.sync.tree_id 和 smb2_tree_id() 都拿不到真实值），
+     * 因此改为：记录「本连接最近一次 tree_connect 的共享名」。
+     * 客户端在同一连接上切换 tree 时会再发一次 tree_connect，
+     * 这里跟着更新即可，create 时直接用当前值。
+     */
+    void set_tree_share(struct smb2_context *ctx, const std::string &name) {
         std::lock_guard<std::mutex> lock(tree_mtx_);
-        tree_shares_[ctx] = n;
+        std::string lower = name;
+        for (size_t i = 0; i < lower.size(); i++) {
+            lower[i] = (char)tolower((unsigned char)lower[i]);
+        }
+        // IPC$ 与磁盘共享在同一连接上并存，分开记，create 时按名字特征选
+        if (lower == "ipc$") {
+            cur_share_[ctx] = "IPC$";
+        }
+        else {
+            disk_share_[ctx] = name;
+        }
     }
 
-    /** 取该连接当前树连接的共享名，未连接时返回空串 */
+    /** 取本连接当前 tree 对应的共享名 */
     std::string tree_share(struct smb2_context *ctx) {
         std::lock_guard<std::mutex> lock(tree_mtx_);
-        auto it = tree_shares_.find(ctx);
-        return it == tree_shares_.end() ? std::string() : it->second;
+        auto it = cur_share_.find(ctx);
+        return it == cur_share_.end() ? std::string() : it->second;
+    }
+
+    /** 取本连接的磁盘共享名（非 IPC$） */
+    std::string disk_share(struct smb2_context *ctx) {
+        std::lock_guard<std::mutex> lock(tree_mtx_);
+        auto it = disk_share_.find(ctx);
+        return it == disk_share_.end() ? std::string() : it->second;
     }
 
     void clear_tree_share(struct smb2_context *ctx) {
-        std::lock_guard<std::mutex> lock(tree_mtx_);
-        tree_shares_.erase(ctx);
+        // 同一连接上可能有多个 tree（SHARE1 与 IPC$），某个 tree 断开
+        // 不应把整条连接的记录清掉，否则后续 create 拿不到共享名。
+        // 这里保留最近一次 tree_connect 的名字，连接销毁时随 map 一起回收。
+        (void)ctx;
     }
 
     void set_ipc_tree(struct smb2_context *ctx, bool on) {
-        std::lock_guard<std::mutex> lock(ipc_mtx_);
-        ipc_trees_[ctx] = on;
+        (void)ctx;
+        (void)on;
     }
 
+    /** 本连接当前 tree 是否为 IPC$ */
     bool is_ipc_tree(struct smb2_context *ctx) {
-        std::lock_guard<std::mutex> lock(ipc_mtx_);
-        auto it = ipc_trees_.find(ctx);
-        return it != ipc_trees_.end() && it->second;
+        std::string s = tree_share(ctx);
+        for (size_t i = 0; i < s.size(); i++) {
+            s[i] = (char)tolower((unsigned char)s[i]);
+        }
+        return s == "ipc$";
     }
 
     uint64_t add_pipe_handle(const std::string &nm) {

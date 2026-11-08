@@ -27,8 +27,10 @@ class Smb2Server {
     // 服务级账号：SMB 认证在 session 阶段，此时还没有共享上下文
     this._username = '';
     this._password = '';
-    // 已列出过内容的目录句柄，避免客户端无限翻页
-    this._listed_handles = new Set();
+    // 已返回过的 (句柄, pattern) → 已发出的条目名集合。
+    // SMB2 客户端带 file_index=0 反复拉取，需要分批返回：
+    // 每次只给还没发过的条目，全部发完后再回空，客户端才会收到 NO_MORE_FILES。
+    this._qd_sent = new Map();
   }
 
   get is_running() {
@@ -149,30 +151,53 @@ class Smb2Server {
     const desired = payload.desired_access;
     const disposition = payload.create_disposition;
 
-    // SMB2_FILE_OPEN = 1，其它值表示创建/覆盖
+    // SMB2 create_disposition 语义：
+    //   0 FILE_SUPERSEDE     存在则覆盖为空，不存在则创建
+    //   1 FILE_OPEN          必须存在
+    //   2 FILE_CREATE        必须不存在
+    //   3 FILE_OPEN_IF       存在则打开，不存在则创建
+    //   4 FILE_OVERWRITE     必须存在，覆盖为空
+    //   5 FILE_OVERWRITE_IF  存在则覆盖为空，不存在则创建
     const is_open = disposition === 1;
+    let existed = false;
     let st = null;
     try {
       st = fs.statSync(full);
+      existed = true;
     } catch (e) {
       st = null;
     }
 
+    if (st && (disposition === 0 || disposition === 4 || disposition === 5)) {
+      // 覆盖类：必须先截断为 0，否则客户端会以旧大小为准再发 SET_INFO 清空数据
+      if (readonly) {
+        return { error: -13 };
+      }
+      if (!st.isDirectory()) {
+        try {
+          fs.truncateSync(full, 0);
+          st = fs.statSync(full);
+        } catch (e) {
+          return { error: -13 };
+        }
+      }
+    }
+
     if (!st) {
-      if (is_open) {
+      if (is_open || disposition === 4) {
         return { error: -2 /* ENOENT */ };
       }
       if (readonly) {
         return { error: -13 };
       }
       try {
-        // 路径以 / 结尾或 CREATE_OPTIONS 带 DIRECTORY 视为建目录
-        const want_dir = payload.create_options === 1 ||
+        // 路径以 / 结尾或 CREATE_OPTIONS 带 FILE_DIRECTORY_FILE(0x1) 视为建目录
+        const opts = Number(payload.create_options) || 0;
+        const want_dir = (opts & 0x1) !== 0 ||
           String(payload.name).endsWith('/');
         if (want_dir) {
           fs.mkdirSync(full, { recursive: true });
-        } else {
-          fs.mkdirSync(path.dirname(full), { recursive: true });
+        } else {          fs.mkdirSync(path.dirname(full), { recursive: true });
           fs.writeFileSync(full, Buffer.alloc(0));
         }
         st = fs.statSync(full);
@@ -195,15 +220,18 @@ class Smb2Server {
       return { error: -13 };
     }
 
+    // FILE_SUPERSEDED=0 / FILE_OPENED=1 / FILE_CREATED=2 / FILE_OVERWRITTEN=3
+    const create_action = !existed ? 2
+      : (disposition === 0 || disposition === 4 || disposition === 5) ? 3
+      : 1;
     return {
       is_dir,
       path: full,
       size: st.size,
-      create_action: is_open ? 1 : 2,
+      create_action,
       delete_on_close,
     };
   }
-
   close(payload) {
     return null;
   }
@@ -264,6 +292,7 @@ class Smb2Server {
       // 回传新的绝对路径，交给 C++ 更新句柄
       return target;
     } catch (e) {
+      console.error("[smb-server] rename 失败:", payload.path, "->", payload.name, e && e.message);
       return { error: -13 };
     }
   }
@@ -285,14 +314,19 @@ class Smb2Server {
   queryDirectory(payload) {
     // 路径由 C++ 侧按句柄查好后传进来，JS 侧不维护句柄表
     const full = payload.path;
-
-    // SMB2 客户端每轮都带 file_index=0，没法靠它区分轮次。
-    // 这里按句柄记录「已列过一次」：第一轮返回全部条目，之后返回 null，
-    // 由服务端回 STATUS_NO_MORE_FILES 让客户端停止翻页。
-    if (this._listed_handles.has(payload.handle_id)) {
+    if (!full) {
       return null;
     }
-    this._listed_handles.add(payload.handle_id);
+
+    // 客户端每次带一个 pattern（可能是 "*" 也可能是指定文件名）。
+    // 同一 (句柄, pattern) 分批返回：先记下所有匹配项，每次只给还没发过的，
+    // 全部发完后再回空，客户端才会收到 NO_MORE_FILES 停止翻页。
+    const key = payload.handle_id + '\u0000' + (payload.pattern || '');
+    let sent = this._qd_sent.get(key);
+    if (!sent) {
+      sent = new Set();
+      this._qd_sent.set(key, sent);
+    }
 
     let names;
     try {
@@ -310,6 +344,9 @@ class Smb2Server {
       if (re && !re.test(d.name)) {
         continue;
       }
+      if (sent.has(d.name)) {
+        continue;
+      }
       const child = path.join(full, d.name);
       let st = null;
       try {
@@ -325,16 +362,20 @@ class Smb2Server {
         ctime: Math.floor(st.ctimeMs / 1000),
         atime: Math.floor(st.atimeMs / 1000),
       });
+      if (entries.length >= 32) {
+        break;
+      }
     }
 
     if (entries.length === 0) {
       return null;
     }
-    const result = encode_dir_entries(entries, payload.buffer_length || 65536);
-    if (result.buffer.length === 0) {
-      return null;
+    for (const e of entries) {
+      sent.add(e.name);
     }
-    return result.buffer;
+    // 返回条目数组，由 C++ 侧填 smb2_fileidbothdirectoryinformation 结构体：
+    // libsmb2 会把 output_buffer 当成结构体数组再序列化，不能给已编码字节
+    return entries;
   }
 
   queryInfo(payload) {
@@ -348,13 +389,14 @@ class Smb2Server {
     } catch (e) {
       return null;
     }
-    return encode_file_all_info({
-      type: st.isDirectory() ? 'dir' : 'file',
+    // 只回原始属性，序列化成 SMB 结构体由 C++ 侧负责：
+    // libsmb2 会把 output_buffer 当成 C 结构体解析，不能回已编码的字节流
+    return {
+      path: full,
       size: st.size,
       mtime: Math.floor(st.mtimeMs / 1000),
-      ctime: Math.floor(st.ctimeMs / 1000),
-      atime: Math.floor(st.atimeMs / 1000),
-    });
+      is_dir: st.isDirectory(),
+    };
   }
 }
 

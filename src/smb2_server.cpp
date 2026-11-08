@@ -1,6 +1,11 @@
 #include "smb2_server.h"
+#include "dcerpc/dcerpc.h"
+#include "dcerpc/server.h"
+#include "dcerpc/srvsvc.h"
+
 #include <cstring>
 #include <chrono>
+#include <vector>
 
 /* ---------------------------------------------------------------- */
 /* file_id <-> handle                                                */
@@ -27,7 +32,10 @@ struct ServerHandlers {
 
     // 统一入口：构造 Smb2Req → CallJs → 读结果
     static bool call(Smb2Server *self, Smb2Req &req) {
-        return self->CallJs(req);
+        bool ok = self->CallJs(req);
+        fprintf(stderr, "[cmd] %-24s ok=%d err=%d\n",
+                req.op.c_str(), ok ? 1 : 0, req.err);
+        return ok;
     }
     static int authorize(struct smb2_server *srvr, struct smb2_context *smb2,
                          const char *user, const char *domain,
@@ -46,7 +54,16 @@ struct ServerHandlers {
         }
         // 把密码交给 libsmb2，由它内部做 NTLMv2 校验
         if (!r.out_password.empty()) {
+            // libsmb2 用 smb2->user 参与 NTLMv2 计算，必须先写入用户名
+            if (user) {
+                smb2_set_user(smb2, user);
+            }
             smb2_set_password(smb2, r.out_password.c_str());
+            fprintf(stderr, "[smb2-server] authorize 已设置 user=%s pwd_len=%zu\n",
+                    user ? user : "(null)", r.out_password.size());
+        } else {
+            fprintf(stderr, "[smb2-server] authorize 未拿到密码, 匿名继续 (user=%s domain=%s err=%d)\n",
+                    user ? user : "(null)", domain ? domain : "(null)", r.err);
         }
         return 0;
     }
@@ -54,14 +71,80 @@ struct ServerHandlers {
     static int create_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                           struct smb2_create_request *req,
                           struct smb2_create_reply *rep) {
-        // IPC$ 上打开的是命名管道（如 srvsvc），不落到文件系统
-        if (self_->is_ipc_tree(smb2)) {
-            std::string pipe_name = req->name ? req->name : "";
-            while (!pipe_name.empty() &&
-                   (pipe_name[0] == '\\' || pipe_name[0] == '/')) {
-                pipe_name.erase(0, 1);
+        memset(rep, 0, sizeof(*rep));
+        std::string req_name = req->name ? req->name : "";
+
+        // FILE_OPEN_BY_FILE_ID：Windows 打开列表里的文件时 name 为空，
+        // 真正的 file_id 放在 create context 的 FILE_OPEN_BY_FILE_ID(0x0A) 里。
+        // 不处理这条会把“按 ID 打开”误当成“打开共享根目录”，
+        // 造成双击文件、新建、删除等操作全部失败。
+        if (req_name.empty() &&
+            (req->create_options & SMB2_FILE_OPEN_BY_FILE_ID) != 0 &&
+            req->create_context != NULL &&
+            req->create_context_length >= 24) {
+            const uint8_t *cc = req->create_context;
+            size_t left = req->create_context_length;
+            // [MS-SMB2] 2.2.13.2 CREATE context：
+            // ChainNext(4) + NameOffset(2) + NameLength(2) + Reserved(4) + Name + Data
+            // 头部固定 12 字节，NameOffset 相对 context 起点。
+            while (left >= 12) {
+                uint32_t chain = (uint32_t)(cc[0] | (cc[1] << 8) |
+                                            (cc[2] << 16) | (cc[3] << 24));
+                uint16_t noff = (uint16_t)(cc[4] | (cc[5] << 8));
+                uint16_t nlen = (uint16_t)(cc[6] | (cc[7] << 8));
+                // FILE_OPEN_BY_FILE_ID 的 tag 是 10 字节 "FileId:   "
+                if (nlen >= 10 && (size_t)noff + nlen <= left &&
+                    memcmp(cc + noff, "FileId:   ", 10) == 0) {
+                    smb2_file_id fid;
+                    memset(fid, 0, SMB2_FD_SIZE);
+                    memcpy(fid, cc + 8, SMB2_FD_SIZE);
+                    std::string by_id_path;
+                    if (self_->get_handle(file_id_to_handle(fid), &by_id_path)) {
+                        req_name = by_id_path;
+                    }
+                    break;
+                }
+                if (chain == 0 || chain > left) {
+                    break;
+                }
+                cc += chain;
+                left -= chain;
             }
-            uint64_t ph = self_->add_pipe_handle(pipe_name);
+        }
+
+        std::string trimmed = req_name;
+        while (!trimmed.empty() &&
+               (trimmed[0] == '\\' || trimmed[0] == '/')) {
+            trimmed.erase(0, 1);
+        }
+
+        // IPC$ 上的请求是命名管道（srvsvc/lsarpc/mdssvc 等）。
+        // tree_id 取自请求头，能准确区分 IPC$ 与磁盘共享；
+        // 再用已知管道名兜一层，避免 tree_id 尚未绑定时的误判。
+        static const char *const known_pipes[] = {"srvsvc", "lsarpc", "samr",
+                                                  "winreg", "netlogon", "spoolss",
+                                                  "mdssvc", "msftewds"};
+        bool name_is_pipe = false;
+        std::string lower = trimmed;
+        for (size_t i = 0; i < lower.size(); i++) {
+            lower[i] = (char)tolower((unsigned char)lower[i]);
+        }
+        for (size_t i = 0; i < sizeof(known_pipes) / sizeof(known_pipes[0]); i++) {
+            if (lower == known_pipes[i]) {
+                name_is_pipe = true;
+                break;
+            }
+        }
+
+        if (self_->is_ipc_tree(smb2) || name_is_pipe) {
+            // 只实现 srvsvc（共享枚举）；其它管道一律以 OBJECT_NAME_NOT_FOUND
+            // 拒绝，客户端会退回只用磁盘共享，不会因此断开连接
+            if (lower != "srvsvc") {
+                fprintf(stderr, "[smb2-server] 拒绝未实现的管道: '%s'\n",
+                        trimmed.c_str());
+                return -ENOENT;
+            }
+            uint64_t ph = self_->add_pipe_handle("srvsvc");
             handle_to_file_id(ph, rep->file_id);
             self_->set_last_file_id(smb2, rep->file_id);
             rep->oplock_level = 0;
@@ -76,16 +159,20 @@ struct ServerHandlers {
 
         Smb2Req r;
         r.op = "create";
-        r.share = self_->tree_share(smb2);
+        r.share = self_->disk_share(smb2);
         r.name = req->name ? req->name : "";
         r.desired_access = req->desired_access;
         r.create_disposition = req->create_disposition;
         r.create_options = req->create_options;
 
         if (!call(self_, r)) {
-            return -1;
+            // 返回 -1 会被 libsmb2 转成 STATUS_NOT_IMPLEMENTED 并可能让
+            // 客户端判定共享不可用；用 ENOENT 表示“没有这个对象”更合适
+            return -ENOENT;
         }
         if (r.err != 0) {
+            fprintf(stderr, "[create] FAILED name='%s' disp=%u opts=0x%x err=%d\n",
+                    r.name.c_str(), r.create_disposition, r.create_options, r.err);
             return r.err;
         }
 
@@ -100,11 +187,21 @@ struct ServerHandlers {
         rep->oplock_level = 0;  // SMB2_OPLOCK_LEVEL_NONE
         rep->flags = 0;
         rep->file_attributes =
-            r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY : SMB2_FILE_ATTRIBUTE_NORMAL;
+            r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                         : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
         rep->create_action = r.out_create_action;
-        rep->end_of_file = r.out_size;
-        rep->allocation_size = r.out_size;
+        // 目录的 end_of_file 必须为 0，否则客户端会把目录当有内容的文件
+        rep->end_of_file = r.out_is_dir ? 0 : r.out_size;
+        rep->allocation_size = r.out_is_dir ? 0 : r.out_size;
         rep->create_context_length = 0;
+
+        fprintf(stderr,
+                "[create] name='%s' disp=%u opts=0x%x access=0x%x -> path='%s' is_dir=%d "
+                "size=%llu action=%u attrs=0x%x\n",
+                req_name.c_str(), req->create_disposition, req->create_options,
+                req->desired_access, r.out_path.c_str(), (int)r.out_is_dir,
+                (unsigned long long)r.out_size, r.out_create_action,
+                rep->file_attributes);
         return 0;
     }
 
@@ -181,6 +278,7 @@ struct ServerHandlers {
     static int tree_connect_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                                 struct smb2_tree_connect_request *req,
                                 struct smb2_tree_connect_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
         // IPC$ 是命名管道共享，srvsvc 的 NetrShareEnum 从这里进；
         // 其它名字一律当磁盘共享，映射到共享根目录。
         if (is_ipc_path(req->path, req->path_length)) {
@@ -229,8 +327,12 @@ struct ServerHandlers {
             }
             return -1;
         }
+        fprintf(stderr, "[smb2-server] tree_connect 接受: '%s' canonical='%s'\n",
+                share.c_str(), self_->canonical_share(share).c_str());
+        // 存配置里的规范名，后续按共享名查目录时才能命中
+        std::string canonical = self_->canonical_share(share);
         self_->set_ipc_tree(smb2, false);
-        self_->set_tree_share(smb2, share);
+        self_->set_tree_share(smb2, canonical);
         rep->share_type = SMB2_SHARE_TYPE_DISK;
         rep->share_flags = 0;
         rep->capabilities = 0;
@@ -253,6 +355,7 @@ struct ServerHandlers {
     static int close_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                          struct smb2_close_request *req,
                          struct smb2_close_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
         uint64_t h = resolve_handle(self_, smb2, req->file_id);
         std::string pipe_name;
         if (self_->get_pipe_name(h, &pipe_name)) {
@@ -264,7 +367,7 @@ struct ServerHandlers {
         if (self_->take_pending_delete(h, &del_path)) {
             Smb2Req del_req;
             del_req.op = "delete";
-            del_req.share = self_->tree_share(smb2);
+            del_req.share = self_->disk_share(smb2);
             del_req.path = del_path;
             call(self_, del_req);
         }
@@ -277,6 +380,10 @@ struct ServerHandlers {
     static int read_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                         struct smb2_read_request *req,
                         struct smb2_read_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
+        // 读不依赖 passthrough，但前一个 handler 可能把它关掉，
+        // 这里显式设为 1 保持全局状态可预期
+        smb2_set_passthrough(smb2, 1);
         uint64_t h = file_id_to_handle(req->file_id);
         std::string path;
         if (!self_->get_handle(h, &path)) {
@@ -285,7 +392,7 @@ struct ServerHandlers {
 
         Smb2Req r;
         r.op = "read";
-        r.share = self_->tree_share(smb2);
+        r.share = self_->disk_share(smb2);
         r.path = path;
         r.handle_id = h;
         r.offset = req->offset;
@@ -317,6 +424,10 @@ struct ServerHandlers {
     static int write_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                          struct smb2_write_request *req,
                          struct smb2_write_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
+        // 写请求的数据区依赖 passthrough 才会被填充到 req->buf，
+        // queryDirectory 为避免结构体内存外泄会把它关掉，这里补回来
+        smb2_set_passthrough(smb2, 1);
         uint64_t h = file_id_to_handle(req->file_id);
         std::string path;
         if (!self_->get_handle(h, &path)) {
@@ -328,7 +439,7 @@ struct ServerHandlers {
 
         Smb2Req r;
         r.op = "write";
-        r.share = self_->tree_share(smb2);
+        r.share = self_->disk_share(smb2);
         r.path = path;
         r.handle_id = h;
         r.offset = req->offset;
@@ -377,7 +488,7 @@ struct ServerHandlers {
 
             Smb2Req r;
             r.op = "rename";
-            r.share = self_->tree_share(smb2);
+            r.share = self_->disk_share(smb2);
             r.path = file_path;
             r.name = target;
             if (!call(self_, r)) {
@@ -397,7 +508,7 @@ struct ServerHandlers {
             }
             Smb2Req r;
             r.op = "truncate";
-            r.share = self_->tree_share(smb2);
+            r.share = self_->disk_share(smb2);
             r.path = file_path;
             r.offset = ei->end_of_file;
             if (!call(self_, r)) {
@@ -409,143 +520,202 @@ struct ServerHandlers {
             return 0;
         }
 
+        if (req->file_info_class == SMB2_FILE_DISPOSITION_INFORMATION) {
+            // 线格式：DeletePending(1) + 保留(1)
+            const uint8_t *raw = (const uint8_t *)req->input_data;
+            if (raw == NULL || req->buffer_length < 1) {
+                return -EINVAL;
+            }
+            if (raw[0] == 0) {
+                // 取消删除标记
+                return 0;
+            }
+            Smb2Req r;
+            r.op = "delete";
+            r.share = self_->disk_share(smb2);
+            r.path = file_path;
+            if (!call(self_, r)) {
+                return -ENOENT;
+            }
+            if (r.err != 0) {
+                return r.err;
+            }
+            return 0;
+        }
+
         return -EOPNOTSUPP;
     }
 
-    // NetrShareEnum 的 NDR 响应（SHARE_INFO_1，返回全部共享）
-    static std::vector<uint8_t> build_share_enum_response(
-        uint16_t call_id,
-        const std::vector<std::pair<std::string, std::string>> &shares,
-        const std::string &remark) {
-        std::vector<uint8_t> b;
-        auto put_u32 = [&b](uint32_t v) {
-            b.push_back((uint8_t)(v & 0xff));
-            b.push_back((uint8_t)((v >> 8) & 0xff));
-            b.push_back((uint8_t)((v >> 16) & 0xff));
-            b.push_back((uint8_t)((v >> 24) & 0xff));
-        };
+    // ── DCE/RPC 服务端（libdcerpc 官方 server runtime）──────────────
+    // 只负责业务数据：编解码、bind、分片、call_id 全由 dcerpc_server_* 处理。
 
-        b.resize(24, 0);
-        b[0] = 5;
-        b[1] = 0;
-        b[2] = 0x02;  // PTYPE_RESPONSE
-        b[3] = 0x03;
-        b[4] = 0x10;
-        b[12] = (uint8_t)(call_id & 0xff);
-        b[13] = (uint8_t)((call_id >> 8) & 0xff);
+    static int srvsvc_NetrShareEnum_stub(struct dcerpc_context *dce,
+                                         struct dcerpc_pdu *pdu,
+                                         void *req_v, void *rep_v) {
+        struct srvsvc_NetrShareEnum_req *req =
+            (struct srvsvc_NetrShareEnum_req *)req_v;
+        struct srvsvc_NetrShareEnum_rep *rep =
+            (struct srvsvc_NetrShareEnum_rep *)rep_v;
 
-        const uint32_t count = (uint32_t)shares.size();
-        const uint32_t level = 1;  // SHARE_INFO_1
-        put_u32(level);       // Level
-        put_u32(level);       // Switch
-        put_u32(0x00020004);  // SHARE_ENUM_STRUCT 指针
-        put_u32(count);       // EntriesRead
-        put_u32(0x00020004);  // Buffer 指针
-        put_u32(count);       // max_count，必须等于 EntriesRead
+        uint32_t level = req->InfoStruct.Level;
+        const std::vector<std::pair<std::string, std::string>> &shares =
+            self_->shares();
+        uint32_t count = (uint32_t)shares.size();
+        const std::string &remark = self_->share_remark();
+        size_t alloc_count = count > 0 ? count : 1;
 
-        // SHARE_INFO_1 固定部分：netname 引用、type、remark 引用
-        // 每条共享的结构引用地址依次递增，NDR 只要求是唯一非零引用
-        for (uint32_t i = 0; i < count; i++) {
-            put_u32(0x00020020 + i * 4);  // netname 引用
-            put_u32(0);                   // STYPE_DISKTREE
-            put_u32(0x00020024 + i * 4);  // remark 引用
+        rep->InfoStruct.Level = level;
+        rep->TotalEntries = count;
+        rep->ResumeHandle = 0;
+        rep->status = 0;
+
+        if (level == 0) {
+            struct srvsvc_SHARE_INFO_0 *buf = (struct srvsvc_SHARE_INFO_0 *)
+                dcerpc_alloc_data(pdu, sizeof(*buf) * alloc_count);
+            if (buf == NULL) {
+                return -1;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                buf[i].NetName = (char *)shares[i].first.c_str();
+            }
+            rep->InfoStruct.ShareInfo.Level0.EntriesRead = count;
+            rep->InfoStruct.ShareInfo.Level0.Buffer = buf;
+        } else if (level == 1) {
+            struct srvsvc_SHARE_INFO_1 *buf = (struct srvsvc_SHARE_INFO_1 *)
+                dcerpc_alloc_data(pdu, sizeof(*buf) * alloc_count);
+            if (buf == NULL) {
+                return -1;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                buf[i].NetName = (char *)shares[i].first.c_str();
+                buf[i].Type = 0;  // STYPE_DISKTREE
+                buf[i].Remark = (char *)remark.c_str();
+            }
+            rep->InfoStruct.ShareInfo.Level1.EntriesRead = count;
+            rep->InfoStruct.ShareInfo.Level1.Buffer = buf;
+        } else if (level == 2) {
+            struct srvsvc_SHARE_INFO_2 *buf = (struct srvsvc_SHARE_INFO_2 *)
+                dcerpc_alloc_data(pdu, sizeof(*buf) * alloc_count);
+            if (buf == NULL) {
+                return -1;
+            }
+            for (uint32_t i = 0; i < count; i++) {
+                buf[i].NetName = (char *)shares[i].first.c_str();
+                buf[i].Type = 0;
+                buf[i].Remark = (char *)remark.c_str();
+                buf[i].Permissions = 0;
+                buf[i].MaxUses = 0xffffffff;
+                buf[i].CurrentUses = 0;
+                buf[i].Path = (char *)shares[i].second.c_str();
+                buf[i].Passwd = (char *)"";
+            }
+            rep->InfoStruct.ShareInfo.Level2.EntriesRead = count;
+            rep->InfoStruct.ShareInfo.Level2.Buffer = buf;
+        } else {
+            return DCERPC_FAULT_OP_RNG_ERROR;
         }
-
-        auto put_ndr_string = [&b, &put_u32](const std::string &utf8) {
-            // UTF-8 → UTF-16LE，NDR 字符串按宽字符计数
-            std::vector<uint16_t> w;
-            for (size_t i = 0; i < utf8.size();) {
-                uint32_t cp = (uint8_t)utf8[i];
-                size_t extra = 0;
-                if (cp < 0x80) {
-                    extra = 0;
-                } else if ((cp & 0xE0) == 0xC0) {
-                    cp &= 0x1F;
-                    extra = 1;
-                } else if ((cp & 0xF0) == 0xE0) {
-                    cp &= 0x0F;
-                    extra = 2;
-                } else if ((cp & 0xF8) == 0xF0) {
-                    cp &= 0x07;
-                    extra = 3;
-                }
-                for (size_t k = 1; k <= extra && i + k < utf8.size(); k++) {
-                    cp = (cp << 6) | ((uint8_t)utf8[i + k] & 0x3F);
-                }
-                i += extra + 1;
-                if (cp >= 0x10000) {
-                    cp -= 0x10000;
-                    w.push_back((uint16_t)(0xD800 | (cp >> 10)));
-                    w.push_back((uint16_t)(0xDC00 | (cp & 0x3FF)));
-                } else {
-                    w.push_back((uint16_t)cp);
-                }
-            }
-            uint32_t chars = (uint32_t)w.size();
-            put_u32(chars + 1);
-            put_u32(0);
-            put_u32(chars + 1);
-            for (size_t i = 0; i < w.size(); i++) {
-                b.push_back((uint8_t)(w[i] & 0xff));
-                b.push_back((uint8_t)(w[i] >> 8));
-            }
-            b.push_back(0);
-            b.push_back(0);
-            // NDR 要求字符串结束后 4 字节对齐
-            while (b.size() % 4 != 0) {
-                b.push_back(0);
-            }
-        };
-        for (const auto &it : shares) {
-            put_ndr_string(it.first);
-            put_ndr_string(remark);
-        }
-
-        put_u32(count);  // TotalEntries
-        put_u32(0);  // ResumeHandle 引用（NULL）
-        put_u32(0);  // WERROR
-
-        uint32_t total = (uint32_t)b.size();
-        b[8] = (uint8_t)(total & 0xff);
-        b[9] = (uint8_t)((total >> 8) & 0xff);
-        b[16] = (uint8_t)((total - 24) & 0xff);
-        b[17] = (uint8_t)(((total - 24) >> 8) & 0xff);
-        return b;
+        return 0;
     }
 
-    static std::vector<uint8_t> build_bind_ack(uint16_t call_id) {
-        static const uint8_t ndr32[20] = {
-            0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11,
-            0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60,
-            0x02, 0x00, 0x00, 0x00
-        };
-        // 布局：24 字节头 + sec_addr_len(2) + 填充到 28 + n_results(1) + 保留(3)
-        //      + context 结果 24 字节（含 transfer syntax）
-        std::vector<uint8_t> out(28 + 24, 0);
-        out[0] = 5;     // version major
-        out[1] = 0;     // version minor
-        out[2] = 0x0c;  // PTYPE_BIND_ACK
-        out[3] = 0x03;  // first | last frag
-        out[4] = 0x10;  // little-endian
-        uint32_t total = (uint32_t)out.size();
-        out[8] = (uint8_t)(total & 0xff);
-        out[9] = (uint8_t)((total >> 8) & 0xff);
-        out[12] = (uint8_t)(call_id & 0xff);
-        out[13] = (uint8_t)((call_id >> 8) & 0xff);
-        out[20] = 0x01;  // assoc_group_id 非 0
-        // p[24..25] = secondary address length = 0
-        // p[26..27] = 保留
-        out[28] = 0x01;  // n_results = 1
-        // p[29..31] = 保留
-        // context 结果从 32 开始：result(2)=0 接受, reason(2)=0
-        memcpy(&out[36], ndr32, 20);
-        return out;
+    // 资源管理器还会调 NetrShareGetInfo（\\host\share 属性页）
+    static int srvsvc_NetrShareGetInfo_stub(struct dcerpc_context *dce,
+                                            struct dcerpc_pdu *pdu,
+                                            void *req_v, void *rep_v) {
+        struct srvsvc_NetrShareGetInfo_req *req =
+            (struct srvsvc_NetrShareGetInfo_req *)req_v;
+        struct srvsvc_NetrShareGetInfo_rep *rep =
+            (struct srvsvc_NetrShareGetInfo_rep *)rep_v;
+
+        const std::vector<std::pair<std::string, std::string>> &shares =
+            self_->shares();
+        const std::string &remark = self_->share_remark();
+        std::string want = req->NetName != NULL ? req->NetName : "";
+        // 客户端可能传 \\host\share，只取最后一段
+        size_t pos = want.find_last_of('\\');
+        std::string name = (pos == std::string::npos) ? want : want.substr(pos + 1);
+
+        uint32_t level = req->Level;
+        for (size_t i = 0; i < shares.size(); i++) {
+            if (shares[i].first != name) {
+                continue;
+            }
+            if (level == 0) {
+                struct srvsvc_SHARE_INFO_0 *info = (struct srvsvc_SHARE_INFO_0 *)
+                    dcerpc_alloc_data(pdu, sizeof(*info));
+                if (info == NULL) {
+                    return -1;
+                }
+                info->NetName = (char *)shares[i].first.c_str();
+                rep->InfoStruct.ShareInfo0 = *info;
+            } else if (level == 1) {
+                struct srvsvc_SHARE_INFO_1 *info = (struct srvsvc_SHARE_INFO_1 *)
+                    dcerpc_alloc_data(pdu, sizeof(*info));
+                if (info == NULL) {
+                    return -1;
+                }
+                info->NetName = (char *)shares[i].first.c_str();
+                info->Type = 0;
+                info->Remark = (char *)remark.c_str();
+                rep->InfoStruct.ShareInfo1 = *info;
+            } else if (level == 2) {
+                struct srvsvc_SHARE_INFO_2 *info = (struct srvsvc_SHARE_INFO_2 *)
+                    dcerpc_alloc_data(pdu, sizeof(*info));
+                if (info == NULL) {
+                    return -1;
+                }
+                info->NetName = (char *)shares[i].first.c_str();
+                info->Type = 0;
+                info->Remark = (char *)remark.c_str();
+                info->Permissions = 0;
+                info->MaxUses = 0xffffffff;
+                info->CurrentUses = 0;
+                info->Path = (char *)shares[i].second.c_str();
+                info->Passwd = (char *)"";
+                rep->InfoStruct.ShareInfo2 = *info;
+            } else {
+                return DCERPC_FAULT_OP_RNG_ERROR;
+            }
+            rep->status = 0;
+            return 0;
+        }
+        rep->status = 0x00000906;  // NERR_NetNameNotFound
+        return 0;
     }
 
-    // DCE/RPC over FSCTL_PIPE_TRANSCEIVE，为 srvsvc 服务
+    // 双击 \\host 时客户端先问服务器信息
+    static int srvsvc_NetrServerGetInfo_stub(struct dcerpc_context *dce,
+                                             struct dcerpc_pdu *pdu,
+                                             void *req_v, void *rep_v) {
+        struct srvsvc_NetrServerGetInfo_req *req =
+            (struct srvsvc_NetrServerGetInfo_req *)req_v;
+        struct srvsvc_NetrServerGetInfo_rep *rep =
+            (struct srvsvc_NetrServerGetInfo_rep *)rep_v;
+
+        if (req->Level != 101) {
+            return DCERPC_FAULT_OP_RNG_ERROR;
+        }
+        struct srvsvc_SERVER_INFO_101 *info = (struct srvsvc_SERVER_INFO_101 *)
+            dcerpc_alloc_data(pdu, sizeof(*info));
+        if (info == NULL) {
+            return -1;
+        }
+        info->PlatformId = 500;      // PLATFORM_ID_NT
+        info->Name = (char *)"filecat";
+        info->VersionMajor = 10;
+        info->VersionMinor = 0;
+        info->Type = 0x00001003;     // SV_TYPE_SERVER_NT | SV_TYPE_WORKSTATION
+        info->Comment = (char *)self_->share_remark().c_str();
+        rep->InfoStruct.ServerInfo101 = *info;
+        rep->status = 0;
+        return 0;
+    }
+
+
+    // DCE/RPC over FSCTL_PIPE_TRANSCEIVE
     static int ioctl_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                          struct smb2_ioctl_request *req,
                          struct smb2_ioctl_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
         rep->ctl_code = req->ctl_code;
         memcpy(rep->file_id, req->file_id, SMB2_FD_SIZE);
         rep->input_offset = 0;
@@ -555,43 +725,56 @@ struct ServerHandlers {
         rep->flags = req->flags;
         rep->output = NULL;
 
+        smb2_set_passthrough(smb2, 1);
+
         uint64_t h = resolve_handle(self_, smb2, req->file_id);
         std::string pipe_name;
         if (!self_->get_pipe_name(h, &pipe_name)) {
-            return -ENOENT;
+            // 非命名管道上的 ioctl 返回错误会让客户端放弃整个连接
+            return 0;
         }
         if (req->ctl_code != SMB2_FSCTL_PIPE_TRANSCEIVE) {
             return -EOPNOTSUPP;
         }
-
-        const uint8_t *in = (const uint8_t *)req->input;
-        uint32_t in_len = req->input_count;
-        if (in == NULL || in_len < 16) {
-            return -EINVAL;
-        }
-
-        uint8_t ptype = in[2];
-        uint16_t call_id = (uint16_t)(in[12] | (in[13] << 8));
-        std::vector<uint8_t> out;
-
-        if (ptype == 0x0b) {
-            out = build_bind_ack(call_id);
-        } else if (ptype == 0x00) {
-            if (in_len < 24) {
-                return -EINVAL;
-            }
-            uint16_t opnum = (uint16_t)(in[22] | (in[23] << 8));
-            if (opnum != 15) {
-                return -EOPNOTSUPP;
-            }
-            out = build_share_enum_response(call_id, self_->shares(),
-                                            self_->share_remark());
-        } else {
+        if (pipe_name != "srvsvc") {
             return -EOPNOTSUPP;
         }
 
-        if (out.empty()) {
+        std::lock_guard<std::mutex> guard(self_->rpc_mutex_);
+        if (self_->rpc_ == NULL) {
             return -ENOMEM;
+        }
+        struct dcerpc_server_pipe *pipe = self_->rpc_pipes_[h];
+        if (pipe == NULL) {
+            pipe = dcerpc_server_pipe_create(self_->rpc_, NULL);
+            if (pipe == NULL) {
+                return -ENOMEM;
+            }
+            self_->rpc_pipes_[h] = pipe;
+        }
+
+        // 客户端写入的字节原样交给 runtime
+        if (req->input != NULL && req->input_count > 0) {
+            if (dcerpc_server_pipe_write(pipe, (const uint8_t *)req->input,
+                                         req->input_count) != 0) {
+                return -EINVAL;
+            }
+        }
+
+        // 取走 runtime 已排队的输出
+        std::vector<uint8_t> out;
+        int more = 0;
+        do {
+            uint8_t tmp[65536];
+            size_t got = dcerpc_server_pipe_read(pipe, tmp, sizeof(tmp), &more);
+            if (got == 0) {
+                break;
+            }
+            out.insert(out.end(), tmp, tmp + got);
+        } while (more);
+
+        if (out.empty()) {
+            return 0;
         }
         rep->output = malloc(out.size());
         if (rep->output == NULL) {
@@ -606,15 +789,24 @@ struct ServerHandlers {
                                    struct smb2_context *smb2,
                                    struct smb2_query_directory_request *req,
                                    struct smb2_query_directory_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
         uint64_t h = file_id_to_handle(req->file_id);
         std::string path;
         if (!self_->get_handle(h, &path)) {
-            return -ENOENT;
+            smb2_file_id last;
+            memset(last, 0, SMB2_FD_SIZE);
+            if (!self_->get_last_file_id(smb2, last)) {
+                return -ENOENT;
+            }
+            h = file_id_to_handle(last);
+            if (!self_->get_handle(h, &path)) {
+                return -ENOENT;
+            }
         }
 
         Smb2Req r;
         r.op = "queryDirectory";
-        r.share = self_->tree_share(smb2);
+        r.share = self_->disk_share(smb2);
         r.path = path;
         r.handle_id = h;
         r.pattern = req->name ? req->name : "*";
@@ -627,66 +819,241 @@ struct ServerHandlers {
         if (r.err != 0) {
             return r.err;
         }
-        if (r.out_bytes.empty()) {
-            // 空 buffer 表示没有更多条目，客户端停止翻页
+        if (r.out_entries.empty()) {
+            // 没有更多条目：length=0 且返回 0，libsmb2 会回 STATUS_NO_MORE_FILES；
+            // 返回负值会被它转成 STATUS_NOT_IMPLEMENTED，客户端会当作错误
             rep->output_buffer = nullptr;
             rep->output_buffer_offset = 0;
             rep->output_buffer_length = 0;
             return 0;
         }
 
-        size_t len = r.out_bytes.size();
-        rep->output_buffer = (uint8_t *)malloc(len);
-        if (!rep->output_buffer) {
+        size_t n = r.out_entries.size();
+        // libsmb2 的 smb2_encode_query_directory_reply 在非 passthrough 模式下
+        // 把 output_buffer 当作「结构体数组」按 PAD_TO_64BIT(sizeof(struct))
+        // 定长步进读取，name 走独立指针，线上布局由它自己拼装。
+        // 因此这里只要按结构体大小分配数组，并填好 name 指针即可。
+        size_t bytes = sizeof(struct smb2_fileidbothdirectoryinformation) * n;
+        struct smb2_fileidbothdirectoryinformation *arr =
+            (struct smb2_fileidbothdirectoryinformation *)calloc(1, bytes);
+        if (arr == NULL) {
             return -ENOMEM;
         }
-        memcpy(rep->output_buffer, r.out_bytes.data(), len);
-        rep->output_buffer_offset = 0;
-        rep->output_buffer_length = (uint32_t)len;
+        for (size_t i = 0; i < n; i++) {
+            const Smb2Req::DirEntry &e = r.out_entries[i];
+            struct smb2_fileidbothdirectoryinformation *d = &arr[i];
+            d->file_index = (uint32_t)(h + i);
+            d->creation_time.tv_sec = (time_t)e.mtime;
+            d->last_access_time.tv_sec = (time_t)e.mtime;
+            d->last_write_time.tv_sec = (time_t)e.mtime;
+            d->change_time.tv_sec = (time_t)e.mtime;
+            d->end_of_file = e.is_dir ? 0 : e.size;
+            d->allocation_size = e.is_dir ? 0 : e.size;
+            d->file_attributes = e.is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                                          : (SMB2_FILE_ATTRIBUTE_ARCHIVE |
+                                             SMB2_FILE_ATTRIBUTE_NORMAL);
+            d->file_name_length = (uint32_t)e.name.size() * 2;
+            // Windows 会拿列表里的 file_id 直接发 FILE_OPEN_BY_FILE_ID 来打开文件，
+            // 所以这里必须是「指向该条目真实路径」的句柄，不能用父句柄或编造值，
+            // 否则后续打开/删除等操作全部失败。
+            std::string child = path;
+            if (!child.empty() && child.back() != '/' && child.back() != '\\') {
+                child += '/';
+            }
+            child += e.name;
+            d->file_id = self_->add_handle(child);
+            d->name = strdup(e.name.c_str());
+        }
+        rep->output_buffer = (uint8_t *)arr;
+        rep->output_buffer_length = (uint32_t)bytes;
+        smb2_set_passthrough(smb2, 0);
         return 0;
     }
 
     static int query_info_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
                               struct smb2_query_info_request *req,
                               struct smb2_query_info_reply *rep) {
+        memset(rep, 0, sizeof(*rep));
+        // 注意：libsmb2 的 smb2_encode_query_info_reply 会把 rep->output_buffer
+        // 直接强转成对应的 C 结构体再序列化，所以这里必须填结构体，
+        // 不能填“已编码好的线上字节”，否则会被当成结构体解析并崩溃。
+        static const uint8_t fs_name[] = {'N', 0, 'T', 0, 'F', 0, 'S', 0};
+
+        // 与 queryDirectory 同理：query_info 的 output_buffer 也是 C 结构体，
+        // passthrough 模式下会被原样 memcpy 出去
+        smb2_set_passthrough(smb2, 0);
+
+        // FILE_SYSTEM：卷信息，与具体文件无关，直接由 C++ 侧产生
+        if (req->info_type == SMB2_0_INFO_FILESYSTEM) {
+            if (req->file_info_class == SMB2_FILE_FS_ATTRIBUTE_INFORMATION) {
+                struct smb2_file_fs_attribute_info *ai =
+                    (struct smb2_file_fs_attribute_info *)
+                    calloc(1, sizeof(*ai));
+                if (ai == NULL) {
+                    return -ENOMEM;
+                }
+                ai->filesystem_attributes = 0x00000003;
+                ai->maximum_component_name_length = 255;
+                ai->filesystem_name_length = sizeof(fs_name);
+                ai->filesystem_name = fs_name;
+                rep->output_buffer = (uint8_t *)ai;
+                rep->output_buffer_length = sizeof(*ai);
+                return 0;
+            }
+            if (req->file_info_class == SMB2_FILE_FS_SIZE_INFORMATION) {
+                struct smb2_file_fs_size_info *si =
+                    (struct smb2_file_fs_size_info *)calloc(1, sizeof(*si));
+                if (si == NULL) {
+                    return -ENOMEM;
+                }
+                const uint64_t unit = 4096;
+                si->total_allocation_units = (uint64_t)(1ULL << 40) / unit;
+                si->available_allocation_units = si->total_allocation_units;
+                si->sectors_per_allocation_unit = 1;
+                si->bytes_per_sector = (uint32_t)unit;
+                rep->output_buffer = (uint8_t *)si;
+                rep->output_buffer_length = sizeof(*si);
+                return 0;
+            }
+            return -EOPNOTSUPP;
+        }
+
         uint64_t h = file_id_to_handle(req->file_id);
         std::string path;
         if (!self_->get_handle(h, &path)) {
-            return -ENOENT;
+            // 复合请求中后续 PDU 的 file_id 为全 F，表示沿用上一个 CREATE 的句柄
+            smb2_file_id last;
+            memset(last, 0, SMB2_FD_SIZE);
+            if (!self_->get_last_file_id(smb2, last)) {
+                return -ENOENT;
+            }
+            h = file_id_to_handle(last);
+            if (!self_->get_handle(h, &path)) {
+                return -ENOENT;
+            }
         }
 
-        Smb2Req r;
-        r.op = "queryInfo";
-        r.share = self_->tree_share(smb2);
-        r.path = path;
-        r.handle_id = h;
-        r.info_type = req->info_type;
-        r.file_info_class = req->file_info_class;
-        r.buffer_length = req->output_buffer_length;
+        // FILE_ALL_INFORMATION：文件/目录属性
+        if (req->info_type == SMB2_0_INFO_FILE &&
+            req->file_info_class == SMB2_FILE_ALL_INFORMATION) {
+            Smb2Req r;
+            r.op = "queryInfo";
+            r.share = self_->disk_share(smb2);
+            r.path = path;
+            r.handle_id = h;
+            if (!call(self_, r)) {
+                return -1;
+            }
+            if (r.err != 0) {
+                return r.err;
+            }
+            size_t plen = r.out_path.size();
+            // libsmb2 的 smb2_encode_file_all_info 会把 name 按 UTF-16 写到结构体
+            // 之后，调用方已按 output_buffer_length + 1024 预留了空间，
+            // 这里只需按结构体大小分配并挂好 name 指针。
+            struct smb2_file_all_info *fi =
+                (struct smb2_file_all_info *)calloc(1, sizeof(*fi));
+            if (fi == NULL) {
+                return -ENOMEM;
+            }
+            // 时间字段是 struct smb2_timeval { tv_sec, tv_usec }，
+            // 由 libsmb2 的 smb2_encode_file_all_info 转成 FILETIME
+            fi->basic.creation_time.tv_sec = (time_t)r.out_mtime;
+            fi->basic.last_access_time.tv_sec = (time_t)r.out_mtime;
+            fi->basic.last_write_time.tv_sec = (time_t)r.out_mtime;
+            fi->basic.change_time.tv_sec = (time_t)r.out_mtime;
+            fi->basic.file_attributes =
+                r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                             : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
+            fi->standard.allocation_size = r.out_is_dir ? 0 : r.out_size;
+            fi->standard.end_of_file = r.out_is_dir ? 0 : r.out_size;
+            fi->standard.number_of_links = 1;
+            fi->standard.directory = r.out_is_dir ? 1 : 0;
+            fi->index_number = h;
+            fi->name = plen ? (const uint8_t *)strdup(r.out_path.c_str()) : NULL;
+            rep->output_buffer = (uint8_t *)fi;
+            rep->output_buffer_length = sizeof(*fi);
+            return 0;
+        }
 
-        if (!call(self_, r)) {
-            return -1;
-        }
-        if (r.err != 0) {
-            return r.err;
-        }
-        if (r.out_bytes.empty()) {
-            return -EINVAL;
+        // FILE_NETWORK_OPEN_INFORMATION：Windows 打开文件前用它预取大小/时间，
+        // 不支持会导致资源管理器与记事本判定文件不可用
+        if (req->info_type == SMB2_0_INFO_FILE &&
+            req->file_info_class == SMB2_FILE_NETWORK_OPEN_INFORMATION) {
+            Smb2Req r;
+            r.op = "queryInfo";
+            r.share = self_->disk_share(smb2);
+            r.path = path;
+            r.handle_id = h;
+            if (!call(self_, r)) {
+                return -1;
+            }
+            if (r.err != 0) {
+                return r.err;
+            }
+            struct smb2_file_network_open_info *ni =
+                (struct smb2_file_network_open_info *)calloc(1, sizeof(*ni));
+            if (ni == NULL) {
+                return -ENOMEM;
+            }
+            ni->creation_time.tv_sec = (time_t)r.out_mtime;
+            ni->last_access_time.tv_sec = (time_t)r.out_mtime;
+            ni->last_write_time.tv_sec = (time_t)r.out_mtime;
+            ni->change_time.tv_sec = (time_t)r.out_mtime;
+            ni->allocation_size = r.out_is_dir ? 0 : r.out_size;
+            ni->end_of_file = r.out_is_dir ? 0 : r.out_size;
+            ni->file_attributes =
+                r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                             : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
+            rep->output_buffer = (uint8_t *)ni;
+            rep->output_buffer_length = sizeof(*ni);
+            return 0;
         }
 
-        size_t len = r.out_bytes.size();
-        rep->output_buffer = (uint8_t *)malloc(len);
-        if (!rep->output_buffer) {
-            return -ENOMEM;
+        // FILE_BASIC_INFORMATION：属性框的时间与属性列
+        if (req->info_type == SMB2_0_INFO_FILE &&
+            req->file_info_class == SMB2_FILE_BASIC_INFORMATION) {
+            Smb2Req r;
+            r.op = "queryInfo";
+            r.share = self_->disk_share(smb2);
+            r.path = path;
+            r.handle_id = h;
+            if (!call(self_, r)) {
+                return -1;
+            }
+            if (r.err != 0) {
+                return r.err;
+            }
+            struct smb2_file_basic_info *bi =
+                (struct smb2_file_basic_info *)calloc(1, sizeof(*bi));
+            if (bi == NULL) {
+                return -ENOMEM;
+            }
+            bi->creation_time.tv_sec = (time_t)r.out_mtime;
+            bi->last_access_time.tv_sec = (time_t)r.out_mtime;
+            bi->last_write_time.tv_sec = (time_t)r.out_mtime;
+            bi->change_time.tv_sec = (time_t)r.out_mtime;
+            bi->file_attributes =
+                r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                             : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
+            rep->output_buffer = (uint8_t *)bi;
+            rep->output_buffer_length = sizeof(*bi);
+            return 0;
         }
-        memcpy(rep->output_buffer, r.out_bytes.data(), len);
-        rep->output_buffer_offset = 0;
-        rep->output_buffer_length = (uint32_t)len;
-        return 0;
+
+        return -EOPNOTSUPP;
     }
 };
 
 Smb2Server *ServerHandlers::self_ = nullptr;
+
+// srvsvc 的 stub 表：opnum -> 业务函数。放在类外，Start() 与 ServerHandlers 都能用。
+static const struct dcerpc_stub g_srvsvc_stubs[] = {
+    {SRVSVC_NETRSHAREENUM,     (char *)"NetrShareEnum",     ServerHandlers::srvsvc_NetrShareEnum_stub},
+    {SRVSVC_NETRSHAREGETINFO,  (char *)"NetrShareGetInfo",  ServerHandlers::srvsvc_NetrShareGetInfo_stub},
+    {SRVSVC_NETRSERVERGETINFO, (char *)"NetrServerGetInfo", ServerHandlers::srvsvc_NetrServerGetInfo_stub},
+    {0, NULL, NULL}
+};
 
 static struct smb2_server_request_handlers g_handlers = {
     nullptr,                              // destruction_event
@@ -839,6 +1206,20 @@ Napi::Value Smb2Server::Start(const Napi::CallbackInfo &info) {
     snprintf(server_.domain, sizeof(server_.domain), "%s", "WORKGROUP");
 
     ServerHandlers::self_ = this;
+
+    // srvsvc 共享枚举：绑定 libdcerpc 官方服务端 runtime
+    if (rpc_ == NULL) {
+        rpc_ = dcerpc_server_create("srvsvc");
+        if (rpc_ == NULL) {
+            throw Napi::Error::New(env, "创建 DCE/RPC 服务端失败");
+        }
+        if (dcerpc_server_add_interface(rpc_, &srvsvc_interface, srvsvc_procs,
+                                        g_srvsvc_stubs, DCERPC_SERVER_ALL_NDR) != 0) {
+            dcerpc_server_destroy(rpc_);
+            rpc_ = NULL;
+            throw Napi::Error::New(env, "注册 srvsvc 接口失败");
+        }
+    }
     running_ = true;
 
     thread_ = std::thread([this]() { ServeLoop(); });
@@ -866,7 +1247,6 @@ void Smb2Server::ServeLoop() {
             // 否则 libsmb2 会把我们自己编码的 blob 当成 C 结构体重新解析，
             // 读 fs->name 指针时错乱导致服务端崩溃。
             smb2_set_passthrough(smb2, 1);
-            smb2_set_security_mode(smb2, 0);
             smb2_register_error_callback(
                 smb2, [](struct smb2_context *, const char *msg) {
                     if (msg && msg[0]) {
@@ -887,6 +1267,14 @@ Napi::Value Smb2Server::Stop(const Napi::CallbackInfo &info) {
         thread_.join();
     }
     running_ = false;
+    if (rpc_ != NULL) {
+        for (auto &it : rpc_pipes_) {
+            dcerpc_server_pipe_destroy(it.second);
+        }
+        rpc_pipes_.clear();
+        dcerpc_server_destroy(rpc_);
+        rpc_ = NULL;
+    }
     if (tsfn_) {
         tsfn_.Release();
         tsfn_ = nullptr;
@@ -932,19 +1320,21 @@ bool Smb2Server::CallJs(Smb2Req &req) {
             // Smb2Req → JS 参数对象
             Napi::Object p = Napi::Object::New(env);
             p.Set("op", Napi::String::New(env, r.op));
-            if (!r.share.empty()) {
-                p.Set("share", Napi::String::New(env, r.share));
-            }
+            // 空串也必须下发：create 打开共享根目录时 name 为空，
+            // 省略会让 JS 侧拿到 undefined 而拼出错误路径
+            p.Set("share", Napi::String::New(env, r.share));
             if (r.op == "authorize") {
                 p.Set("user", Napi::String::New(env, r.user));
                 p.Set("domain", Napi::String::New(env, r.domain));
                 p.Set("workstation", Napi::String::New(env, r.workstation));
             }
-            if (!r.name.empty()) {
+            if (r.op == "create") {
                 p.Set("name", Napi::String::New(env, r.name));
                 p.Set("desired_access", Napi::Number::New(env, r.desired_access));
                 p.Set("create_disposition", Napi::Number::New(env, r.create_disposition));
                 p.Set("create_options", Napi::Number::New(env, r.create_options));
+            } else if (!r.name.empty()) {
+                p.Set("name", Napi::String::New(env, r.name));
             }
             if (!r.path.empty()) {
                 p.Set("path", Napi::String::New(env, r.path));
@@ -953,6 +1343,9 @@ bool Smb2Server::CallJs(Smb2Req &req) {
             if (r.op == "read") {
                 p.Set("offset", Napi::Number::New(env, (double)r.offset));
                 p.Set("length", Napi::Number::New(env, r.length));
+            }
+            if (r.op == "truncate") {
+                p.Set("offset", Napi::Number::New(env, (double)r.offset));
             }
             if (r.op == "write") {
                 p.Set("offset", Napi::Number::New(env, (double)r.offset));
@@ -994,6 +1387,31 @@ bool Smb2Server::CallJs(Smb2Req &req) {
             if (threw) {
                 r.ok = false;
                 r.err = -1;
+            } else if (ret.IsArray() && r.op == "queryDirectory") {
+                Napi::Array arr = ret.As<Napi::Array>();
+                r.out_entries.clear();
+                for (uint32_t i = 0; i < arr.Length(); i++) {
+                    Napi::Value v = arr.Get(i);
+                    if (!v.IsObject()) {
+                        continue;
+                    }
+                    Napi::Object o = v.As<Napi::Object>();
+                    Smb2Req::DirEntry e;
+                    if (o.Has("name")) {
+                        e.name = o.Get("name").As<Napi::String>().Utf8Value();
+                    }
+                    if (o.Has("size")) {
+                        e.size = (uint64_t)o.Get("size").As<Napi::Number>().Int64Value();
+                    }
+                    if (o.Has("mtime")) {
+                        e.mtime = (uint64_t)o.Get("mtime").As<Napi::Number>().Int64Value();
+                    }
+                    if (o.Has("type")) {
+                        e.is_dir =
+                            o.Get("type").As<Napi::String>().Utf8Value() == "dir";
+                    }
+                    r.out_entries.push_back(e);
+                }
             } else if (ret.IsNull() || ret.IsUndefined()) {
                 // create 之类的成功返回 null 不代表有数据
             } else if (ret.IsNumber() && r.op == "create") {
@@ -1010,6 +1428,19 @@ bool Smb2Server::CallJs(Smb2Req &req) {
                 if (o.Has("error")) {
                     r.err = o.Get("error").As<Napi::Number>().Int32Value();
                     r.ok = false;
+                } else if (r.op == "queryInfo") {
+                    if (o.Has("path")) {
+                        r.out_path = o.Get("path").As<Napi::String>().Utf8Value();
+                    }
+                    if (o.Has("size")) {
+                        r.out_size = (uint64_t)o.Get("size").As<Napi::Number>().Int64Value();
+                    }
+                    if (o.Has("mtime")) {
+                        r.out_mtime = (uint64_t)o.Get("mtime").As<Napi::Number>().Int64Value();
+                    }
+                    if (o.Has("is_dir")) {
+                        r.out_is_dir = o.Get("is_dir").As<Napi::Boolean>().Value();
+                    }
                 } else if (r.op == "create") {
                     if (o.Has("path")) {
                         r.out_path = o.Get("path").As<Napi::String>().Utf8Value();

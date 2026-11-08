@@ -30,7 +30,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 #include <dcerpc/dcerpc.h>
-#include <dcerpc/dcerpc-srvsvc.h>
+#include <dcerpc/srvsvc.h>
 
 #ifndef discard_const
 #define discard_const(ptr) ((void *)((intptr_t)(ptr)))
@@ -45,11 +45,11 @@ enum dcerpc_encoding output_encoding = ENCODING_YAML;
 int idx;
 int num_ops;
 struct opdata {
-        uint8_t buf[65536];
-        struct dcerpc_iovec iov;        
-        int offset;
+        uint8_t buf[65536];             /* the request YAML */
+        struct dcerpc_iovec iov;        /* decodes the request from buf */
+        struct dcerpc_iovec rep;        /* the response, growable */
 };
-#define MAXOPDATA 16
+#define MAXOPDATA 64
 struct opdata opdata[MAXOPDATA];
 
 struct rpc_cb_data {
@@ -60,7 +60,7 @@ struct rpc_cb_data {
         struct dcerpc_pdu *rep_pdu;
 };
 
-int usage(void)
+int usage(int status)
 {
         fprintf(stderr, "Usage:\n"
                 "dcerpc [-j|--json] [-c|--coder <file.so>] <smb2-url> [request.yaml]\n\n"
@@ -74,7 +74,7 @@ int usage(void)
                 "smb://[<domain;][<username>@]<host>[:<port>]/IPC$/<service-name>\n"
                 "Request file is YAML (or stdin if omitted). Multiple requests\n"
                 "in one file are separated by a line consisting of only ---.\n");
-        exit(1);
+        exit(status);
 }
 
 /*
@@ -242,7 +242,7 @@ parse_placeholder(const char *body, size_t body_len,
  *   @name:-n@   - value of "name" from the reply n steps back (idx - n)
  *
  * cur_idx is the index of the request being prepared; responses for
- * completed ops 0 .. cur_idx-1 live in opdata[].buf.
+ * completed ops 0 .. cur_idx-1 live in opdata[].rep.
  */
 static int
 apply_response_substitutions(struct opdata *req, int cur_idx)
@@ -302,7 +302,7 @@ apply_response_substitutions(struct opdata *req, int cur_idx)
                         return -1;
                 }
                 src_idx = cur_idx - steps_back;
-                yaml = (const char *)opdata[src_idx].buf;
+                yaml = (const char *)opdata[src_idx].rep.buf;
 
                 value = lookup_response_field(yaml, name);
                 if (value == NULL) {
@@ -421,9 +421,6 @@ void si_cb(struct dcerpc_context *dce, int status,
 {
         struct rpc_cb_data *rpc_cb_data = cb_data;
 
-        opdata[idx].offset = 0;
-        memset(opdata[idx].iov.buf, 0, opdata[idx].iov.len);
-
         if (command_data == NULL) {
                 printf("No Response pdu (status=%d) %s\n",
                        status, dcerpc_get_error(dce));
@@ -437,7 +434,7 @@ void si_cb(struct dcerpc_context *dce, int status,
                 printf("---\n");
         }
         rpc_cb_data->rep = command_data;
-        rpc_cb_data->rep_pdu = dcerpc_allocate_pdu(dce, output_encoding, DCERPC_ENCODE, rpc_cb_data->proc->rep_size);
+        rpc_cb_data->rep_pdu = dcerpc_allocate_pdu(dce, DCERPC_ENCODE | output_encoding, rpc_cb_data->proc->rep_size);
         if (rpc_cb_data->rep_pdu == NULL) {
                 printf("failed to allocate Response pdu\n");
                 exit(10);
@@ -445,14 +442,16 @@ void si_cb(struct dcerpc_context *dce, int status,
         
         /* We might need to reference req from the reply */
         dcerpc_set_request(rpc_cb_data->rep_pdu, rpc_cb_data->req);
+        /* Kept for @name@ lookups by the requests that follow */
         if (dcerpc_do_coder(rpc_cb_data->proc->name, dce, rpc_cb_data->rep_pdu,
-                            &opdata[idx].iov, &opdata[idx].offset,
+                            &opdata[idx].rep,
                             rpc_cb_data->rep, rpc_cb_data->proc->rep_coder)) {
-                printf("Failed to encode REP as %s\n",
-                       output_encoding == ENCODING_JSON ? "JSON" : "YAML");
+                printf("Failed to encode REP as %s: %s\n",
+                       output_encoding == ENCODING_JSON ? "JSON" : "YAML",
+                       dcerpc_get_error(dce));
                 exit(10);
         }
-        printf("%s\n", opdata[idx].iov.buf);
+        printf("%s\n", opdata[idx].rep.buf);
 
         
         free(rpc_cb_data->req);
@@ -495,12 +494,17 @@ void do_request(struct dcerpc_context *dce)
                 exit(9);
         }
         
+        opdata[idx].iov = (struct dcerpc_iovec){
+                .buf = opdata[idx].buf,
+                .max_offset = sizeof(opdata[idx].buf),
+        };
+
         /*
          * Find the name of the procedure: the key on the first line that is
          * neither blank nor a # comment (the YAML decoder skips those too).
          */
         name = (char *)opdata[idx].iov.buf;
-        end = name + opdata[idx].iov.len;
+        end = name + opdata[idx].iov.max_offset;
         while (name < end && *name != '\0') {
                 char *p = name;
 
@@ -529,7 +533,6 @@ void do_request(struct dcerpc_context *dce)
                         break;
                 }
         }
-        opdata[idx].offset = 0;
 
         if (rpc_cb_data->proc == NULL) {
                 printf("Could not find a procedure with the name %.*s\n",
@@ -543,16 +546,16 @@ void do_request(struct dcerpc_context *dce)
                 exit(10);
         }
 
-        rpc_cb_data->req_pdu = dcerpc_allocate_pdu(dce, ENCODING_YAML, DCERPC_DECODE, rpc_cb_data->proc->req_size);
+        rpc_cb_data->req_pdu = dcerpc_allocate_pdu(dce, DCERPC_DECODE | ENCODING_YAML, rpc_cb_data->proc->req_size);
         if (rpc_cb_data->req_pdu == NULL) {
                 printf("Failed to allocate request PDU\n");
                 exit(9);
         }
         if (dcerpc_do_coder(rpc_cb_data->proc->name, dce, rpc_cb_data->req_pdu,
-                            &opdata[idx].iov, &opdata[idx].offset,
+                            &opdata[idx].iov,
                             rpc_cb_data->req, rpc_cb_data->proc->req_coder)) {
                 printf("Failed to decode REQ from YAML\n");
-                exit(10);
+                exit(9);
         }
 
         if (dcerpc_call_async(dce,
@@ -587,17 +590,13 @@ int main(int argc, char *argv[])
         struct dcerpc_context *dce;
         struct smb2_url *url;
 	struct pollfd pfd;
-        int i, fd, count, argi;
+        int fd, count, argi;
         uint8_t tmp[65536];
         ssize_t n;
         char *start, *p, *sep;
         const char *smb_url;
         const char *yaml_path;
-
-        for (i = 0; i < MAXOPDATA; i++) {
-                opdata[i].iov.buf = &opdata[i].buf[0];
-                opdata[i].iov.len = 65536;
-        }
+        int rc = 0;
 
         /* Parse optional flags before positional arguments */
         argi = 1;
@@ -608,22 +607,22 @@ int main(int argc, char *argv[])
                 } else if (!strcmp(argv[argi], "-c") || !strcmp(argv[argi], "--coder")) {
                         if (argi + 1 >= argc) {
                                 fprintf(stderr, "%s requires a filename\n", argv[argi]);
-                                usage();
+                                usage(1);
                         }
                         if (load_coder(argv[argi + 1])) {
                                 exit(9);
                         }
                         argi += 2;
                 } else if (!strcmp(argv[argi], "-h") || !strcmp(argv[argi], "--help")) {
-                        usage();
+                        usage(0);
                 } else {
                         fprintf(stderr, "Unknown option: %s\n", argv[argi]);
-                        usage();
+                        usage(1);
                 }
         }
 
         if (argi >= argc) {
-                usage();
+                usage(1);
         }
         smb_url = argv[argi++];
         yaml_path = (argi < argc) ? argv[argi] : NULL;
@@ -716,18 +715,18 @@ int main(int argc, char *argv[])
 	smb2 = smb2_init_context();
         if (smb2 == NULL) {
                 fprintf(stderr, "Failed to init context\n");
-                exit(0);
+                exit(10);
         }
 
         url = smb2_parse_url(smb2, smb_url);
         if (url == NULL) {
                 fprintf(stderr, "Failed to parse url: %s\n",
                         smb2_get_error(smb2));
-                exit(0);
+                exit(9);
         }
         if (url->path == NULL || url->path[0] == '\0') {
                 printf("No service name in URL. Use smb://<host>/IPC$/<service>\n");
-                exit(10);
+                exit(9);
         }
 
         if (url->user) {
@@ -759,11 +758,13 @@ int main(int argc, char *argv[])
         }
         if (service == NULL) {
                 printf("Could not find a service with the name %s\n", url->path);
-                exit(10);
+                exit(9);
         }
         
         service_name = url->path;
-        if (dcerpc_connect_context_async(dce, url->path, service->interface,
+        if (dcerpc_connect_context_async(dce,
+                       service->pipe ? service->pipe : url->path,
+                       service->interface,
                        co_cb, NULL) != 0) {
 		printf("Failed to connect dce context. %s\n",
                        smb2_get_error(smb2));
@@ -784,6 +785,7 @@ int main(int argc, char *argv[])
 		if (smb2_service(smb2, pfd.revents) < 0) {
 			printf("smb2_service failed with : %s\n",
                                smb2_get_error(smb2));
+                        rc = 10;
 			break;
 		}
 	}
@@ -793,5 +795,5 @@ int main(int argc, char *argv[])
         smb2_destroy_url(url);
         smb2_destroy_context(smb2);
         
-	return 0;
+	return rc;
 }

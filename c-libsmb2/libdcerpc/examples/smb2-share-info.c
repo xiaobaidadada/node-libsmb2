@@ -28,7 +28,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
 #include <dcerpc/dcerpc.h>
-#include <dcerpc/dcerpc-srvsvc.h>
+#include <dcerpc/srvsvc.h>
 
 #ifndef discard_const
 #define discard_const(ptr) ((void *)((intptr_t)(ptr)))
@@ -62,33 +62,33 @@ print_share(int lvl, union srvsvc_SHARE_INFO *si)
 
         switch (lvl) {
         case SRVSVC_SHARE_INFO_0:
-                netname = si->ShareInfo0.netname;
+                netname = si->ShareInfo0.NetName;
                 has_type = 0;
                 break;
         case SRVSVC_SHARE_INFO_1:
-                netname = si->ShareInfo1.netname;
-                remark = si->ShareInfo1.remark;
-                type = si->ShareInfo1.type;
+                netname = si->ShareInfo1.NetName;
+                remark = si->ShareInfo1.Remark;
+                type = si->ShareInfo1.Type;
                 break;
         case SRVSVC_SHARE_INFO_2:
-                netname = si->ShareInfo2.netname;
-                remark = si->ShareInfo2.remark;
-                type = si->ShareInfo2.type;
+                netname = si->ShareInfo2.NetName;
+                remark = si->ShareInfo2.Remark;
+                type = si->ShareInfo2.Type;
                 break;
         case SRVSVC_SHARE_INFO_501:
-                netname = si->ShareInfo501.netname;
-                remark = si->ShareInfo501.remark;
-                type = si->ShareInfo501.type;
+                netname = si->ShareInfo501.NetName;
+                remark = si->ShareInfo501.Remark;
+                type = si->ShareInfo501.Type;
                 break;
         case SRVSVC_SHARE_INFO_502:
-                netname = si->ShareInfo502.netname;
-                remark = si->ShareInfo502.remark;
-                type = si->ShareInfo502.type;
+                netname = si->ShareInfo502.NetName;
+                remark = si->ShareInfo502.Remark;
+                type = si->ShareInfo502.Type;
                 break;
         case SRVSVC_SHARE_INFO_503:
-                netname = si->ShareInfo503.netname;
-                remark = si->ShareInfo503.remark;
-                type = si->ShareInfo503.type;
+                netname = si->ShareInfo503.NetName;
+                remark = si->ShareInfo503.Remark;
+                type = si->ShareInfo503.Type;
                 break;
         default:
                 /* other levels have no name; see the YAML below */
@@ -137,9 +137,7 @@ void si_cb(struct dcerpc_context *dce, int status,
 
         struct smb2_context *smb2 = dcerpc_get_smb2_context(dce);
         struct dcerpc_pdu *yaml_pdu;
-        struct dcerpc_iovec iov;
-        static unsigned char buf[65536];
-        int offset = 0;
+        struct dcerpc_iovec iov = {0};
 
         dce = dcerpc_create_context(smb2);
         if (dce == NULL) {
@@ -149,29 +147,25 @@ void si_cb(struct dcerpc_context *dce, int status,
         }
         printf("YAML:\n");
         printf("---\n");
-        yaml_pdu = dcerpc_allocate_pdu(dce, ENCODING_YAML, DCERPC_ENCODE, sizeof(struct srvsvc_NetrShareGetInfo_req));
-        offset = 0;
-        iov.len = 65536;
-        iov.buf = buf;
-        if (dcerpc_do_coder("NetrShareGetInfo", dce, yaml_pdu, &iov, &offset, si_req, srvsvc_NetrShareGetInfo_req_coder)) {
+        yaml_pdu = dcerpc_allocate_pdu(dce, DCERPC_ENCODE | ENCODING_YAML, sizeof(struct srvsvc_NetrShareGetInfo_req));
+        if (dcerpc_do_coder("NetrShareGetInfo", dce, yaml_pdu, &iov, si_req, srvsvc_NetrShareGetInfo_req_coder)) {
                 printf("Failed to encode REQ as YAML\n");
                 exit(10);
         }
         printf("%s\n", iov.buf);
+        dcerpc_free_iovec(&iov);
         dcerpc_free_pdu(dce, yaml_pdu);
         
         printf("---\n");
-        yaml_pdu = dcerpc_allocate_pdu(dce, ENCODING_YAML, DCERPC_ENCODE, sizeof(struct srvsvc_NetrShareGetInfo_rep));
-        offset = 0;
-        iov.len = 65536;
-        iov.buf = buf;
+        yaml_pdu = dcerpc_allocate_pdu(dce, DCERPC_ENCODE | ENCODING_YAML, sizeof(struct srvsvc_NetrShareGetInfo_rep));
         /* We need to reference req->Level from the reply */
         dcerpc_set_request(yaml_pdu, si_req);
-        if (dcerpc_do_coder("NetrShareGetInfo", dce, yaml_pdu, &iov, &offset, rep, srvsvc_NetrShareGetInfo_rep_coder)) {
+        if (dcerpc_do_coder("NetrShareGetInfo", dce, yaml_pdu, &iov, rep, srvsvc_NetrShareGetInfo_rep_coder)) {
                 printf("Failed to encode REP as YAML\n");
                 exit(10);
         }
         printf("%s\n", iov.buf);
+        dcerpc_free_iovec(&iov);
         dcerpc_free_pdu(dce, yaml_pdu);
 
         

@@ -33,8 +33,31 @@ dnl  libdcerpc uses libsmb2 as its transport. When built as part of the
 dnl  libsmb2 tree the parent configure passes LIBSMB2_CFLAGS and
 dnl  LIBSMB2_LIBS pointing at the uninstalled libsmb2, which makes
 dnl  PKG_CHECK_MODULES skip the pkg-config lookup.
+dnl  The srvsvc coders are generated from IDL by idlcomp.py.
+AC_PATH_PROG([PYTHON3], [python3])
+AS_IF([test -z "$PYTHON3"], [
+    AC_MSG_ERROR([python3 is required to generate the IDL coders])
+])
+
+dnl  --without-libsmb2 builds only the coders: no transport, so no
+dnl  binding or calls, and no dependency on libsmb2 at all. The utilities
+dnl  and the examples need the transport and are not built.
+AC_ARG_WITH([libsmb2],
+            [AS_HELP_STRING([--without-libsmb2],
+                            [Build only the coders, without the libsmb2 transport])],
+            [], [with_libsmb2=yes])
+
 PKG_PROG_PKG_CONFIG
-PKG_CHECK_MODULES([LIBSMB2], [libsmb2 >= 7.0.0])
+AS_IF([test "x$with_libsmb2" != "xno"], [
+    PKG_CHECK_MODULES([LIBSMB2], [libsmb2 >= 7.0.0])
+    AC_DEFINE([HAVE_LIBSMB2], [1], [Build the libsmb2 transport])
+    LIBDCERPC_REQUIRES="libsmb2 >= 7.0.0"
+], [
+    AC_MSG_NOTICE([Building without libsmb2: coders only])
+    LIBDCERPC_REQUIRES=""
+])
+AM_CONDITIONAL([HAVE_LIBSMB2], [test "x$with_libsmb2" != "xno"])
+AC_SUBST([LIBDCERPC_REQUIRES])
 
 AC_ARG_ENABLE([examples],
               [AS_HELP_STRING([--enable-examples],
@@ -56,8 +79,10 @@ AS_IF([test "$GCC" = "yes"], [
 AC_SUBST([WARN_CFLAGS])
 
 dnl  The dcerpc utility loads coders with dlopen()
-AC_SEARCH_LIBS([dlopen], [dl], [],
-               [AC_MSG_ERROR([dlopen not found, libdl is required])])
+AS_IF([test "x$with_libsmb2" != "xno"], [
+    AC_SEARCH_LIBS([dlopen], [dl], [],
+                   [AC_MSG_ERROR([dlopen not found, libdl is required])])
+])
 
 dnl  ncurses is optional; without it the winreg-tui utility is not built.
 have_ncurses=no
@@ -77,6 +102,14 @@ AC_CONFIG_FILES([
     Makefile
     examples/Makefile
     include/Makefile
+    srvsvc/Makefile
+    wkssvc/Makefile
+    samr/Makefile
+    dssetup/Makefile
+    netlogon/Makefile
+    winreg/Makefile
+    lsa/Makefile
+    epm/Makefile
     tests/Makefile
     utils/Makefile
     libdcerpc.pc

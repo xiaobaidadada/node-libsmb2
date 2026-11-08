@@ -14,6 +14,9 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #ifndef _DCERPC_H_
 #define _DCERPC_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +34,7 @@ struct dcerpc_pdu;
 
 /* Opaque; full definition in smb2/libsmb2.h. */
 struct smb2_context;
+struct dcerpc_utf16_buf;
 
 /*
  * Buffer descriptor for NDR/YAML/JSON encode/decode.
@@ -38,15 +42,39 @@ struct smb2_context;
  * so the same buffer can be cast either way; dcerpc owns this type so
  * consumers do not need to include or redefine smb2_iovec.
  */
+/*
+ * A coding buffer and the position in it. Coders code at offset and advance
+ * it; offset never exceeds max_offset, the size of buf, and offset ==
+ * max_offset means the buffer is used up.
+ *
+ * Encoding into an iovec with buf == NULL, e.g.
+ *     struct dcerpc_iovec vec = {0};
+ * allocates the buffer and sets .free = free. A buffer whose .free is free
+ * grows as needed: it is doubled (realloc, new space zeroed) up to
+ * DCERPC_IOVEC_MAX_SIZE. Any other buffer has a fixed size. After encoding,
+ * offset is the encoded length; free the buffer with dcerpc_free_iovec().
+ *
+ * To decode, point the iovec at the data:
+ *     struct dcerpc_iovec vec = { .buf = data, .max_offset = len };
+ * Decoding never writes, grows or frees the buffer, so it may be read-only,
+ * and the decoded data does not point into it.
+ */
+#define DCERPC_IOVEC_INITIAL_SIZE 1024
+#define DCERPC_IOVEC_MAX_SIZE (16 * 1024 * 1024)
+
 struct dcerpc_iovec {
         uint8_t *buf;
-        size_t len;
+        size_t offset;
+        size_t max_offset;
         void (*free)(void *);
 };
 
+/* Free iov->buf with iov->free, if set, and reset the iovec */
+void dcerpc_free_iovec(struct dcerpc_iovec *iov);
+
 /* Encoder/Decoder for a DCERPC object */
 typedef int (*dcerpc_coder)(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-                            struct dcerpc_iovec *iov, int *offset,
+                            struct dcerpc_iovec *iov,
                             void *ptr);
 
 struct dcerpc_uint32_pretty_printer_bitfield {
@@ -63,21 +91,21 @@ struct dcerpc_uint32_pretty_printer {
 /* Encoder/Decoder for a DCERPC object with a pretty-printer*/
 typedef int (*dcerpc_coder_pp)(char *name, struct dcerpc_context *dce,
                                struct dcerpc_pdu *pdu,
-                               struct dcerpc_iovec *iov, int *offset,
+                               struct dcerpc_iovec *iov,
                                void *ptr,
                                struct dcerpc_uint32_pretty_printer *pp);
 
 /* Encoder/Decoder for a DCERPC object with a pass-through coder*/
 typedef int (*dcerpc_coder_cdr)(char *name, struct dcerpc_context *dce,
                                 struct dcerpc_pdu *pdu,
-                                struct dcerpc_iovec *iov, int *offset,
+                                struct dcerpc_iovec *iov,
                                 void *ptr,
                                 dcerpc_coder coder);
 
 /* Encoder/Decoder for a DCERPC union with a discriminator */
 typedef int (*dcerpc_coder_union)(char *name, struct dcerpc_context *dce,
                                   struct dcerpc_pdu *pdu,
-                                  struct dcerpc_iovec *iov, int *offset,
+                                  struct dcerpc_iovec *iov,
                                   uint32_t *switch_is, void *ptr,
                                   dcerpc_coder coder);
 
@@ -85,6 +113,7 @@ enum dcerpc_encoding {
         ENCODING_NDR    = 0,
         ENCODING_YAML   = 1,
         ENCODING_JSON   = 2
+        /* at most 255: the low 8 bits of the dcerpc_allocate_pdu() flags */
 };
 
 enum ptr_type {
@@ -121,7 +150,7 @@ struct dcerpc_utf16 {
         uint32_t offset;          /* internal use only */
         uint32_t actual_count;    /* internal use only */
 
-        struct smb2_utf16 *utf16; /* internal use only */
+        struct dcerpc_utf16_buf *utf16; /* internal use only */
         
         const char *utf8;
 };
@@ -129,6 +158,12 @@ struct dcerpc_utf16 {
 extern p_syntax_id_t lsa_interface;
 extern p_syntax_id_t srvsvc_interface;
 extern p_syntax_id_t wkssvc_interface;
+extern p_syntax_id_t samr_interface;
+/* The NDR32 and NDR64 transfer syntaxes */
+extern p_syntax_id_t ndr32_syntax;
+extern p_syntax_id_t ndr64_syntax;
+extern p_syntax_id_t dssetup_interface;
+extern p_syntax_id_t netlogon_interface;
 extern p_syntax_id_t winreg_interface;
 extern p_syntax_id_t epm_interface;
         
@@ -164,6 +199,8 @@ struct dcerpc_stub {
 struct dcerpc_service {
         struct dcerpc_service *next;
         const char *name;
+        /* named pipe it is reached through; NULL when it is name */
+        const char *pipe;
         p_syntax_id_t *interface;
         struct dcerpc_procedure *procs;
 };
@@ -178,12 +215,25 @@ extern struct dcerpc_service *dcerpc_services;
 int dcerpc_register_coder(const char *name,
                           p_syntax_id_t *interface,
                           struct dcerpc_procedure *procs);
+/*
+ * Like dcerpc_register_coder() for a service that is not reached through
+ * a pipe of its own name, e.g. dssetup through lsarpc. pipe may be NULL.
+ */
+int dcerpc_register_service(const char *name, const char *pipe,
+                            p_syntax_id_t *interface,
+                            struct dcerpc_procedure *procs);
 
 /*
  * Create a DCE/RPC context on an existing smb2 context.
  * The caller retains ownership of smb2; dcerpc_destroy_context() will not
  * free it. Use this when you need fine-grained smb2 configuration before
  * connecting IPC$ / opening a pipe.
+ *
+ * smb2 can be NULL. Such a context can only be used to encode and decode,
+ * for example in a server that has its own SMB2 implementation and passes
+ * the request stubs to the coders. Connecting and calls fail with -EINVAL.
+ * A libdcerpc built without libsmb2 (--without-libsmb2, WITH_LIBSMB2=OFF)
+ * only accepts NULL here.
  */
 struct dcerpc_context *dcerpc_create_context(struct smb2_context *smb2);
 /*
@@ -202,6 +252,10 @@ struct dcerpc_context *dcerpc_create_context(struct smb2_context *smb2);
  */
 struct dcerpc_context *dcerpc_create_context_smb(const char *smb_url);
 void dcerpc_free_data(struct dcerpc_context *dce, void *data);
+/*
+ * The last error. With an smb2 context this is smb2_get_error(), which
+ * also holds the errors from libsmb2 itself.
+ */
 const char *dcerpc_get_error(struct dcerpc_context *dce);
 int dcerpc_connect_context_async(struct dcerpc_context *dce,
                                  const char *path, p_syntax_id_t *syntax,
@@ -216,6 +270,24 @@ int dcerpc_connect_context_async(struct dcerpc_context *dce,
 int dcerpc_connect_context(struct dcerpc_context *dce,
                            const char *path, p_syntax_id_t *syntax);
 /*
+ * RPC-level security with a Netlogon secure channel (auth type 68):
+ * every PDU after the bind is signed (DCERPC_AUTH_LEVEL_INTEGRITY) or
+ * also sealed (DCERPC_AUTH_LEVEL_PRIVACY) with sch, from
+ * dcerpc_schannel_create() and checked with
+ * dcerpc_schannel_check_server_credential(). domain and computer are the
+ * NetBIOS names of the domain and of the machine account the channel was
+ * set up for; the bind sends them. Call before connecting; sch must
+ * outlive the context. Returns 0 or -errno.
+ */
+#define DCERPC_AUTH_TYPE_SCHANNEL   68
+#define DCERPC_AUTH_LEVEL_INTEGRITY 5
+#define DCERPC_AUTH_LEVEL_PRIVACY   6
+struct dcerpc_schannel;
+int dcerpc_set_schannel(struct dcerpc_context *dce,
+                        struct dcerpc_schannel *sch, int auth_level,
+                        const char *domain, const char *computer);
+
+/*
  * Free a dcerpc context. Always closes an open named pipe (best-effort).
  * If the context was created with dcerpc_create_context_smb(), also
  * disconnects IPC$ and destroys the owned smb2 context. If created with
@@ -223,6 +295,7 @@ int dcerpc_connect_context(struct dcerpc_context *dce,
  */
 void dcerpc_destroy_context(struct dcerpc_context *dce);
 
+/* NULL if the context was created without an smb2 context */
 struct smb2_context *dcerpc_get_smb2_context(struct dcerpc_context *dce);
 void *dcerpc_get_pdu_payload(struct dcerpc_pdu *pdu);
 
@@ -245,6 +318,10 @@ int dcerpc_open_async(struct dcerpc_context *dce, dcerpc_cb cb, void *cb_data);
  *
  * On error, command_data is NULL; there is nothing to free for the reply.
  * Request-side buffers supplied by the caller are never part of this tree.
+ *
+ * req must stay valid until cb is called: decoding the reply reads [in]
+ * values from it, such as the level of a GetInfo reply's union or the
+ * size_is() of an [out] array.
  */
 int dcerpc_call_async(struct dcerpc_context *dce,
                       int opnum,
@@ -265,8 +342,7 @@ void *dcerpc_call(struct dcerpc_context *dce,
                   dcerpc_coder rep_coder, int decode_size);
 
 int dcerpc_do_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                    struct dcerpc_iovec *iov,
-                    int *offset, void *ptr,
+                    struct dcerpc_iovec *iov, void *ptr,
                     dcerpc_coder coder);
 /*
  * Read a YAML file and decode it with coder into a newly allocated structure
@@ -275,9 +351,8 @@ int dcerpc_do_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *p
  * Creates a temporary smb2/dcerpc context internally; the caller does not
  * pass or manage a dcerpc_context. The returned pointer is a dcerpc mem-tree
  * root (same model as a successful dcerpc_call_async reply). Nested decode
- * allocations and the file buffer (loaded via dcerpc_alloc_data so YAML
- * string pointers into the buffer stay valid) are owned by that root. Free
- * with dcerpc_free_data(NULL, ptr) — the dce argument is unused.
+ * allocations, strings included, are owned by that root. Free with
+ * dcerpc_free_data(NULL, ptr) — the dce argument is unused.
  *
  * Returns NULL on error.
  * The top-level YAML key is taken from the file and must match what coder
@@ -286,12 +361,56 @@ int dcerpc_do_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *p
 void *dcerpc_read_yaml_file(const char *filename,
                             dcerpc_coder coder,
                             int decode_size);
-#define DCERPC_DECODE 0
-#define DCERPC_ENCODE 1
+/*
+ * PDU flags for dcerpc_allocate_pdu(): the direction, the NDR flavor and
+ * the encoding in one uint32_t.
+ *
+ *    31    30    29    28 .. 8     7 .. 0
+ *  +-----+-----+-----+---------+----------+
+ *  | DIR | BE  | N64 |reserved | encoding |
+ *  +-----+-----+-----+---------+----------+
+ *
+ * DIR  set: encode (C -> wire/text)    clear: decode
+ * BE   set: big-endian NDR             clear: little-endian
+ * N64  set: NDR64                      clear: NDR32
+ *
+ * BE and N64 only apply to ENCODING_NDR. The reserved bits must be 0.
+ */
+#define DCERPC_DECODE           0x00000000U
+#define DCERPC_ENCODE           0x80000000U
+#define DCERPC_BIG_ENDIAN       0x40000000U
+#define DCERPC_NDR64            0x20000000U
+#define DCERPC_DIRECTION_MASK   0x80000000U
+#define DCERPC_ENCODING_MASK    0x000000ffU
+
+#define DCERPC_PDU_ENCODING(flags) \
+        ((enum dcerpc_encoding)((flags) & DCERPC_ENCODING_MASK))
+
+/*
+ * A PDU for coding data with the encoding, direction and NDR flavor given
+ * by flags (DCERPC_ENCODE | ENCODING_NDR | DCERPC_NDR64, ...), and a
+ * payload of payload_size bytes for the C structure being coded.
+ * Returns NULL, with the error set on dce, if flags are invalid.
+ */
 struct dcerpc_pdu *dcerpc_allocate_pdu(struct dcerpc_context *dce,
-                                       enum dcerpc_encoding encoding,
-                                       int direction, int payload_size);
+                                       uint32_t flags, int payload_size);
+/* The NDR flavor negotiated at BIND: DCERPC_NDR64 and/or DCERPC_BIG_ENDIAN */
+uint32_t dcerpc_get_ndr_flavor(struct dcerpc_context *dce);
 void dcerpc_free_pdu(struct dcerpc_context *dce, struct dcerpc_pdu *pdu);
+
+/*
+ * Full pointers ([ptr]) are numbered 1, 2, ... in a request, and the
+ * reply continues after the highest id of its request. Windows sends the
+ * data after every full pointer, so libdcerpc never refers back to an
+ * earlier one; it only numbers them.
+ *
+ * dcerpc_get_full_pointer_id() is the highest full pointer id coded in
+ * pdu so far. A server encoding a reply calls
+ * dcerpc_set_full_pointer_id(reply_pdu, dcerpc_get_full_pointer_id(
+ * request_pdu)) before encoding it.
+ */
+uint64_t dcerpc_get_full_pointer_id(struct dcerpc_pdu *pdu);
+void dcerpc_set_full_pointer_id(struct dcerpc_pdu *pdu, uint64_t id);
 
 /*
  * Allocate size bytes associated with pdu. Freed automatically when the
@@ -302,6 +421,9 @@ void *dcerpc_alloc_data(struct dcerpc_pdu *pdu, size_t size);
 
 void dcerpc_set_size_is(struct dcerpc_pdu *pdu, uint32_t size_is);
 uint32_t dcerpc_get_size_is(struct dcerpc_pdu *pdu);
+/* length_is() of a conformant-varying array, as size_is() */
+void dcerpc_set_length_is(struct dcerpc_pdu *pdu, uint32_t length_is);
+uint32_t dcerpc_get_length_is(struct dcerpc_pdu *pdu);
 void dcerpc_set_switch_is(struct dcerpc_pdu *pdu, int switch_is);
 int dcerpc_get_switch_is(struct dcerpc_pdu *pdu);
 /*
@@ -316,64 +438,88 @@ void dcerpc_set_unicode_max_length(struct dcerpc_pdu *pdu, uint16_t max_length);
 uint16_t dcerpc_get_unicode_max_length(struct dcerpc_pdu *pdu);
 void dcerpc_set_request(struct dcerpc_pdu *pdu, void *request);
 void *dcerpc_get_request(struct dcerpc_pdu *pdu);
+/*
+ * In a server stub (<dcerpc/server.h>): the call whose request pdu holds,
+ * NULL for any other pdu.
+ */
+struct dcerpc_server_call;
+struct dcerpc_server_call *dcerpc_pdu_server_call(struct dcerpc_pdu *pdu);
 
 int ndr_ptr_coder(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-                  struct dcerpc_iovec *iov, int *offset, void *ptr,
+                  struct dcerpc_iovec *iov, void *ptr,
                   enum ptr_type type, dcerpc_coder coder);
 int ndr_carray_coder(char *name, struct dcerpc_context *ctx,
                      struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset,
+                     struct dcerpc_iovec *iov,
                      uint32_t num, void *ptr, int elem_size, dcerpc_coder coder);
 int ndr_uint8_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                    struct dcerpc_iovec *iov, int *offset, void *ptr);
+                    struct dcerpc_iovec *iov, void *ptr);
 int ndr_uint16_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset, void *ptr);
+                     struct dcerpc_iovec *iov, void *ptr);
 int ndr_uint32_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset, void *ptr);
+                     struct dcerpc_iovec *iov, void *ptr);
 int ndr_uint3264_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                       struct dcerpc_iovec *iov, int *offset, void *ptr);
+                       struct dcerpc_iovec *iov, void *ptr);
 int ndr_union_coder(char *name, struct dcerpc_context *ctx,
                     struct dcerpc_pdu *pdu,
-                    struct dcerpc_iovec *iov, int *offset,
+                    struct dcerpc_iovec *iov,
                     uint32_t *switch_is, void *ptr, dcerpc_coder coder);
 int ndr_utf16_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                    struct dcerpc_iovec *iov, int *offset, void *ptr);
+                    struct dcerpc_iovec *iov, void *ptr);
 int ndr_utf16z_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset, void *ptr);
+                     struct dcerpc_iovec *iov, void *ptr);
 int ndr_uuid_coder(char *name, struct dcerpc_context *dce,
                    struct dcerpc_pdu *pdu,
-                   struct dcerpc_iovec *iov, int *offset,
+                   struct dcerpc_iovec *iov,
                    void *ptr);
 int ndr_sid_coder(char *name, struct dcerpc_context *dce,
                   struct dcerpc_pdu *pdu,
-                  struct dcerpc_iovec *iov, int *offset,
+                  struct dcerpc_iovec *iov,
                   void *ptr);
 
 int dcerpc_ptr_coder(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset, void *ptr,
+                     struct dcerpc_iovec *iov, void *ptr,
                      enum ptr_type type, dcerpc_coder coder);
 int dcerpc_uint8_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                       struct dcerpc_iovec *iov, int *offset, void *ptr);
+                       struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_uint16_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset, void *ptr);
+                        struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_uint16_coder_pp(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                           struct dcerpc_iovec *iov, int *offset, void *ptr,
+                           struct dcerpc_iovec *iov, void *ptr,
                            struct dcerpc_uint32_pretty_printer *pp);
+/*
+ * An enum without [v1_enum]: 16 bits in NDR32, 32 bits in NDR64. ptr is a
+ * uint16_t *. YAML/JSON as dcerpc_uint16_coder_pp.
+ */
+int dcerpc_enum16_coder(char *name, struct dcerpc_context *ctx,
+                        struct dcerpc_pdu *pdu,
+                        struct dcerpc_iovec *iov, void *ptr,
+                        struct dcerpc_uint32_pretty_printer *pp);
 int dcerpc_uint32_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset, void *ptr);
+                        struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_uint32_coder_pp(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                           struct dcerpc_iovec *iov, int *offset, void *ptr,
+                           struct dcerpc_iovec *iov, void *ptr,
                            struct dcerpc_uint32_pretty_printer *pp);
 int dcerpc_uint64_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset, void *ptr);
+                        struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_utf16_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                       struct dcerpc_iovec *iov, int *offset, void *ptr);
+                       struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_utf16z_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset, void *ptr);
+                        struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_carray_coder(char *name, struct dcerpc_context *ctx,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         uint32_t num, void *ptr, int elem_size, dcerpc_coder coder);
+/*
+ * Conformant-varying array of max_count elements of which num are sent
+ * ([size_is(max_count), length_is(num)]). YAML/JSON show the num elements
+ * as dcerpc_carray_coder() does.
+ */
+int dcerpc_cvarray_coder(char *name, struct dcerpc_context *ctx,
+                         struct dcerpc_pdu *pdu,
+                         struct dcerpc_iovec *iov,
+                         uint32_t max_count, uint32_t num, void *ptr,
+                         int elem_size, dcerpc_coder coder);
 /*
  * Like dcerpc_carray_coder() for an array of plain values (integers,
  * strings, SIDs, ...): NDR is identical; YAML/JSON show a list of bare
@@ -381,26 +527,73 @@ int dcerpc_carray_coder(char *name, struct dcerpc_context *ctx,
  */
 int dcerpc_scalar_carray_coder(char *name, struct dcerpc_context *ctx,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         uint32_t num, void *ptr, int elem_size, dcerpc_coder coder);
+/*
+ * Like dcerpc_cvarray_coder() for an array of plain values: YAML/JSON
+ * show the num elements as dcerpc_scalar_carray_coder() does.
+ */
+int dcerpc_scalar_cvarray_coder(char *name, struct dcerpc_context *ctx,
+                                struct dcerpc_pdu *pdu,
+                                struct dcerpc_iovec *iov,
+                                uint32_t max_count, uint32_t num, void *ptr,
+                                int elem_size, dcerpc_coder coder);
 int dcerpc_union_coder(char *name, struct dcerpc_context *ctx,
                        struct dcerpc_pdu *pdu,
-                       struct dcerpc_iovec *iov, int *offset,
+                       struct dcerpc_iovec *iov,
                        uint32_t *switch_is, void *ptr, dcerpc_coder coder);
+/*
+ * A union switched by a plain (16-bit in NDR32) enum. In NDR64 the arm is
+ * aligned to ndr64_align, the largest alignment of all the arms ([MS-RPCE]
+ * 2.2.5.3.4.4); in NDR32 only to its own, by its coder ([C706] 14.3.2;
+ * ndr32_align is unused).
+ */
+int dcerpc_union_enum16_coder(char *name, struct dcerpc_context *ctx,
+                              struct dcerpc_pdu *pdu,
+                              struct dcerpc_iovec *iov,
+                              uint32_t *switch_is, void *ptr,
+                              dcerpc_coder coder,
+                              int ndr32_align, int ndr64_align);
+/* A union switched by a 32-bit value; the arm aligned as above */
+int dcerpc_union_u32_coder(char *name, struct dcerpc_context *ctx,
+                           struct dcerpc_pdu *pdu,
+                           struct dcerpc_iovec *iov,
+                           uint32_t *switch_is, void *ptr,
+                           dcerpc_coder coder,
+                           int ndr32_align, int ndr64_align);
 int dcerpc_struct_coder(char *name, struct dcerpc_context *ctx,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         void *ptr, dcerpc_coder coder);
+/*
+ * A structure with its NDR alignment known: idlcomp passes the alignment of
+ * the structure's largest member for NDR32 and NDR64. NDR aligns the start
+ * to it, and NDR64 also pads the end; YAML/JSON as dcerpc_struct_coder.
+ */
+int dcerpc_aligned_struct_coder(char *name, struct dcerpc_context *ctx,
+                                struct dcerpc_pdu *pdu,
+                                struct dcerpc_iovec *iov,
+                                void *ptr, dcerpc_coder coder,
+                                int ndr32_align, int ndr64_align);
+/*
+ * A structure as an array element: NDR as dcerpc_aligned_struct_coder,
+ * YAML/JSON code its members directly (not nested under a key).
+ */
+int dcerpc_aligned_element_coder(char *name, struct dcerpc_context *ctx,
+                                 struct dcerpc_pdu *pdu,
+                                 struct dcerpc_iovec *iov,
+                                 void *ptr, dcerpc_coder coder,
+                                 int ndr32_align, int ndr64_align);
 int dcerpc_context_handle_coder(char *name, struct dcerpc_context *dce,
                                 struct dcerpc_pdu *pdu,
-                                struct dcerpc_iovec *iov, int *offset,
+                                struct dcerpc_iovec *iov,
                                 void *ptr);
 int dcerpc_uuid_coder(char *name, struct dcerpc_context *ctx,
                       struct dcerpc_pdu *pdu,
-                      struct dcerpc_iovec *iov, int *offset, void *ptr);
+                      struct dcerpc_iovec *iov, void *ptr);
 int dcerpc_sid_coder(char *name, struct dcerpc_context *dce,
                      struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset,
+                     struct dcerpc_iovec *iov,
                      void *ptr);
 
 /*
@@ -416,8 +609,18 @@ struct dcerpc_bytes {
 };
 int dcerpc_bytes_coder(char *name, struct dcerpc_context *dce,
                        struct dcerpc_pdu *pdu,
-                       struct dcerpc_iovec *iov, int *offset,
+                       struct dcerpc_iovec *iov,
                        void *ptr);
+
+/*
+ * byte data[len] — a fixed-size byte array, e.g. NETLOGON_CREDENTIAL.
+ * NDR: the len bytes, with no count and 1-byte alignment.
+ * YAML/JSON: a hex string of exactly len bytes.
+ */
+int dcerpc_fixed_bytes_coder(char *name, struct dcerpc_context *dce,
+                             struct dcerpc_pdu *pdu,
+                             struct dcerpc_iovec *iov,
+                             uint8_t *data, uint32_t len);
 
 /*
  * Blob: a [size_is(len)] unique byte array whose bytes are a packet-form
@@ -432,11 +635,11 @@ int dcerpc_bytes_coder(char *name, struct dcerpc_context *dce,
  */
 int dcerpc_blob_len_coder(char *name, struct dcerpc_context *dce,
                           struct dcerpc_pdu *pdu,
-                          struct dcerpc_iovec *iov, int *offset,
+                          struct dcerpc_iovec *iov,
                           uint32_t *len, void *obj, dcerpc_coder coder);
 int dcerpc_blob_coder(char *name, struct dcerpc_context *dce,
                       struct dcerpc_pdu *pdu,
-                      struct dcerpc_iovec *iov, int *offset,
+                      struct dcerpc_iovec *iov,
                       uint32_t len, void *objp, size_t obj_size,
                       dcerpc_coder coder);
 
@@ -455,7 +658,7 @@ struct dcerpc_varying_bytes {
 };
 int dcerpc_varying_bytes_coder(char *name, struct dcerpc_context *dce,
                                struct dcerpc_pdu *pdu,
-                               struct dcerpc_iovec *iov, int *offset,
+                               struct dcerpc_iovec *iov,
                                void *ptr);
 /*
  * RPC_UNICODE_STRING (MS-DTYP). Buffer is not required to be NUL-terminated.
@@ -471,14 +674,65 @@ int dcerpc_varying_bytes_coder(char *name, struct dcerpc_context *dce,
  */
 int dcerpc_RPC_UNICODE_STRING_coder(char *name, struct dcerpc_context *dce,
                                     struct dcerpc_pdu *pdu,
-                                    struct dcerpc_iovec *iov, int *offset,
+                                    struct dcerpc_iovec *iov,
                                     void *ptr);
 int dcerpc_RPC_UNICODE_STRINGz_coder(char *name, struct dcerpc_context *dce,
                                      struct dcerpc_pdu *pdu,
-                                     struct dcerpc_iovec *iov, int *offset,
+                                     struct dcerpc_iovec *iov,
                                      void *ptr);
 /* MS-RRP name for the NUL-terminated form */
 #define dcerpc_RRP_UNICODE_STRING_coder dcerpc_RPC_UNICODE_STRINGz_coder
+
+/*
+ * Endpoint mapper built-in types (C706 Appendix O), used by epm/epm.idl
+ * as twr_t and EPM_ANNOTATION and coded in dcerpc-epm.c, and helpers to
+ * parse protocol towers. The interface itself, and its
+ * constants (EPM_PROTOCOL_*, EPM_STATUS_*), are in <dcerpc/epm.h>.
+ */
+/*
+ * twr_t — opaque protocol tower (C706).
+ * typedef struct {
+ *     unsigned32 tower_length;
+ *     [size_is(tower_length)] byte tower_octet_string[];
+ * } twr_t, *twr_p_t;
+ *
+ * A conformant structure: in NDR its max_count comes first. Its NDR
+ * alignment is 4 (the hoisted max_count is not a member).
+ */
+struct epm_twr_t {
+        uint32_t TowerLength;
+        uint8_t *TowerOctetString;
+};
+
+/* twr_t: the members, without the YAML/JSON nesting or NDR alignment */
+int dcerpc_epm_twr_coder(char *name, struct dcerpc_context *dce,
+                         struct dcerpc_pdu *pdu,
+                         struct dcerpc_iovec *iov,
+                         void *ptr);
+/* twr_t as a structure: what epm.idl's twr_t built-in type codes with */
+int dcerpc_epm_twr_struct_coder(char *name, struct dcerpc_context *dce,
+                                struct dcerpc_pdu *pdu,
+                                struct dcerpc_iovec *iov,
+                                void *ptr);
+/*
+ * [string] char annotation[64]: a fixed-size varying string (offset and
+ * actual_count, then the characters; no max_count). ptr is a char **.
+ */
+int dcerpc_epm_annotation_coder(char *name, struct dcerpc_context *dce,
+                                struct dcerpc_pdu *pdu,
+                                struct dcerpc_iovec *iov,
+                                void *ptr);
+
+/*
+ * Parse a tower returned by ept_Map / ept_Lookup.
+ * On success for ncacn_np: *pipe_out is malloc'd pipe path (e.g. "\\pipe\\...").
+ * On success for ncacn_ip_tcp: *port_out is set; *ipv4_out is malloc'd dotted IP.
+ * Returns 0 on success, -1 if the tower is not a recognized layout.
+ */
+int dcerpc_epm_tower_get_ncacn_np(const struct epm_twr_t *twr,
+                                  char **pipe_out, char **host_out);
+int dcerpc_epm_tower_get_ncacn_ip_tcp(const struct epm_twr_t *twr,
+                                      char **ipv4_out, uint16_t *port_out);
 
 #ifdef __cplusplus
 }
