@@ -32,10 +32,7 @@ struct ServerHandlers {
 
     // 统一入口：构造 Smb2Req → CallJs → 读结果
     static bool call(Smb2Server *self, Smb2Req &req) {
-        bool ok = self->CallJs(req);
-        fprintf(stderr, "[cmd] %-24s ok=%d err=%d\n",
-                req.op.c_str(), ok ? 1 : 0, req.err);
-        return ok;
+        return self->CallJs(req);
     }
     static int authorize(struct smb2_server *srvr, struct smb2_context *smb2,
                          const char *user, const char *domain,
@@ -59,11 +56,6 @@ struct ServerHandlers {
                 smb2_set_user(smb2, user);
             }
             smb2_set_password(smb2, r.out_password.c_str());
-            fprintf(stderr, "[smb2-server] authorize 已设置 user=%s pwd_len=%zu\n",
-                    user ? user : "(null)", r.out_password.size());
-        } else {
-            fprintf(stderr, "[smb2-server] authorize 未拿到密码, 匿名继续 (user=%s domain=%s err=%d)\n",
-                    user ? user : "(null)", domain ? domain : "(null)", r.err);
         }
         return 0;
     }
@@ -140,8 +132,6 @@ struct ServerHandlers {
             // 只实现 srvsvc（共享枚举）；其它管道一律以 OBJECT_NAME_NOT_FOUND
             // 拒绝，客户端会退回只用磁盘共享，不会因此断开连接
             if (lower != "srvsvc") {
-                fprintf(stderr, "[smb2-server] 拒绝未实现的管道: '%s'\n",
-                        trimmed.c_str());
                 return -ENOENT;
             }
             uint64_t ph = self_->add_pipe_handle("srvsvc");
@@ -171,8 +161,6 @@ struct ServerHandlers {
             return -ENOENT;
         }
         if (r.err != 0) {
-            fprintf(stderr, "[create] FAILED name='%s' disp=%u opts=0x%x err=%d\n",
-                    r.name.c_str(), r.create_disposition, r.create_options, r.err);
             return r.err;
         }
 
@@ -195,13 +183,6 @@ struct ServerHandlers {
         rep->allocation_size = r.out_is_dir ? 0 : r.out_size;
         rep->create_context_length = 0;
 
-        fprintf(stderr,
-                "[create] name='%s' disp=%u opts=0x%x access=0x%x -> path='%s' is_dir=%d "
-                "size=%llu action=%u attrs=0x%x\n",
-                req_name.c_str(), req->create_disposition, req->create_options,
-                req->desired_access, r.out_path.c_str(), (int)r.out_is_dir,
-                (unsigned long long)r.out_size, r.out_create_action,
-                rep->file_attributes);
         return 0;
     }
 
@@ -320,15 +301,8 @@ struct ServerHandlers {
         }
         if (share.empty() || !self_->has_share(share)) {
             // 返回负数由 libsmb2 统一转成错误应答，客户端会把这个共享显示为不可用
-            fprintf(stderr, "[smb2-server] tree_connect 拒绝共享: '%s' 已配置=%zu\n",
-                    share.c_str(), self_->shares().size());
-            for (const auto &it : self_->shares()) {
-                fprintf(stderr, "[smb2-server]   可用共享: '%s'\n", it.first.c_str());
-            }
             return -1;
         }
-        fprintf(stderr, "[smb2-server] tree_connect 接受: '%s' canonical='%s'\n",
-                share.c_str(), self_->canonical_share(share).c_str());
         // 存配置里的规范名，后续按共享名查目录时才能命中
         std::string canonical = self_->canonical_share(share);
         self_->set_ipc_tree(smb2, false);
@@ -1228,36 +1202,24 @@ Napi::Value Smb2Server::Start(const Napi::CallbackInfo &info) {
     for (int i = 0; i < 100 && server_.fd == 0; i++) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    fprintf(stderr, "[smb2-server] bind 后 fd=%d listener_ready=%d\n",
-            (int)server_.fd, (int)server_.listener_ready);
 
     return env.Undefined();
 }
 
 void Smb2Server::ServeLoop() {
     struct smb2_context *ctx = nullptr;
-    fprintf(stderr, "[smb2-server] 进入主循环, port=%d handlers=%p\n",
-            server_.port, (void *)server_.handlers);
     int rc = smb2_serve_port(
         &server_, 4,
         [](struct smb2_context *smb2, void *cb_data) {
-            fprintf(stderr, "[smb2-server] 新连接 fd=%d\n", smb2_get_fd(smb2));
             smb2_set_version(smb2, SMB2_VERSION_ANY);
             // 开启 passthrough：目录项/文件信息按 wire format 原样收发。
             // 否则 libsmb2 会把我们自己编码的 blob 当成 C 结构体重新解析，
             // 读 fs->name 指针时错乱导致服务端崩溃。
             smb2_set_passthrough(smb2, 1);
-            smb2_register_error_callback(
-                smb2, [](struct smb2_context *, const char *msg) {
-                    if (msg && msg[0]) {
-                        fprintf(stderr, "[smb2-server] 错误: %s\n", msg);
-                    }
-                });
             auto *p = (struct smb2_context **)cb_data;
             *p = smb2;
         },
         &ctx);
-    fprintf(stderr, "[smb2-server] 主循环退出 rc=%d fd=%d\n", rc, server_.fd);
     running_ = false;
 }
 
@@ -1371,11 +1333,8 @@ bool Smb2Server::CallJs(Smb2Req &req) {
             } catch (const Napi::Error &e) {
                 // JS 侧抛异常时不能让它逃出去：一旦跳过下面的 notify_all，
                 // 服务线程会永久阻塞在条件变量上。
-                fprintf(stderr, "[smb2-server] handler %s 抛异常: %s\n",
-                        r.op.c_str(), e.Message().c_str());
                 threw = true;
             } catch (...) {
-                fprintf(stderr, "[smb2-server] handler %s 抛未知异常\n", r.op.c_str());
                 threw = true;
             }
 
