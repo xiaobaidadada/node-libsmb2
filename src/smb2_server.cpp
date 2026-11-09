@@ -24,11 +24,347 @@ static uint64_t file_id_to_handle(const smb2_file_id fid) {
 }
 
 /* ---------------------------------------------------------------- */
-/* handler 实现                                                      */
 /* ---------------------------------------------------------------- */
+/* srvsvc 共享枚举服务端（IPC$ / srvsvc）                             */
+/* ---------------------------------------------------------------- */
+/*
+ * iOS / macOS 的文件 App 在用户不指定共享名时会先做共享枚举：
+ *   连接 IPC$ -> 打开 srvsvc 命名管道 -> DCE/RPC BIND -> NetrShareEnum
+ *
+ * libdcerpc 自带完整的服务端运行时（BIND、REQUEST 分发、NDR 编解码），
+ * 这里只需要挂一个 NetrShareEnum 的 stub，把共享名按 SHARE_INFO_1 返回。
+ */
+
+// NetrShareEnum 在 srvsvc 接口里的 opnum（[MS-SRVS] 3.1.4.8）
+#define SRVSVC_OPNUM_NETRSHAREENUM 15
+// srvsvc 方法返回的 WERROR，0 表示成功
+#define SRVSVC_STATUS_SUCCESS 0
+// 共享类型：磁盘共享（[MS-SRVS] 2.2.2.4）
+#define SRVSVC_STYPE_DISKTREE 0
+
+class Smb2Server;
+
+// 当前正在服务的实例，供 srvsvc stub 取共享名列表
+static Smb2Server *g_srvsvc_owner = nullptr;
+
 
 struct ServerHandlers {
     static Smb2Server *self_;
+
+    // DCE/RPC PDU 类型（[C706] 12.6.1）
+    enum {
+        DCE_PDU_REQUEST = 0,
+        DCE_PDU_BIND = 11,
+        DCE_PDU_BIND_ACK = 12,
+        DCE_PDU_RESPONSE = 2,
+    };
+    // PDU 头标志位：首片 + 末片
+    static const uint8_t DCE_PFC_FIRST_LAST = 0x03;
+    // 数据表示：小端
+    static const uint8_t DCE_DR_LE = 0x10;
+    // bind_ack 的 ack_result：0 为接受
+    static const uint16_t DCE_ACK_ACCEPT = 0;
+    // srvsvc 接口的 opnum：NetrShareEnum（[MS-SRVS] 3.1.4.8）
+    static const uint16_t SRVSVC_OPNUM_SHARE_ENUM = 15;
+
+    static void put_le16(std::vector<uint8_t> &v, uint16_t x) {
+        v.push_back((uint8_t)(x & 0xff));
+        v.push_back((uint8_t)(x >> 8));
+    }
+    static void put_le32(std::vector<uint8_t> &v, uint32_t x) {
+        v.push_back((uint8_t)(x & 0xff));
+        v.push_back((uint8_t)((x >> 8) & 0xff));
+        v.push_back((uint8_t)((x >> 16) & 0xff));
+        v.push_back((uint8_t)((x >> 24) & 0xff));
+    }
+    static uint16_t get_le16(const uint8_t *p) {
+        return (uint16_t)(p[0] | (p[1] << 8));
+    }
+    static uint32_t get_le32(const uint8_t *p) {
+        return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) |
+                          ((uint32_t)p[3] << 24));
+    }
+    // 在 DCE 头部补齐 4 字节
+    static void pad4(std::vector<uint8_t> &v) {
+        while (v.size() & 3) {
+            v.push_back(0);
+        }
+    }
+
+    /**
+     * 回应 BIND：把客户端请求的接口/传输语法按 NDR32 接受。
+     *
+     * 只需要一个 ACK 结果，指向 NDR32（8a885d04-1ceb-11c9-9fe8-08002b104860），
+     * 客户端随后用同样的 context_id 发 REQUEST。
+     */
+    static void build_bind_ack(const uint8_t *in, uint32_t in_len,
+                               std::vector<uint8_t> &out) {
+        // NDR32 传输语法 UUID（线格式按小端序列化）
+        static const uint8_t ndr32_uuid[16] = {
+            0x04, 0x5d, 0x88, 0x8a, 0xeb, 0x1c, 0xc9, 0x11,
+            0x9f, 0xe8, 0x08, 0x00, 0x2b, 0x10, 0x48, 0x60};
+        // 客户端会用这个地址在管道上继续访问。
+        // NDR 里的 secondary_address 是长度前缀的字符串，不含结尾 '\0'。
+        static const char sec_addr[] = "\\PIPE\\srvsvc";
+        const uint16_t sec_len = (uint16_t)(sizeof(sec_addr) - 1);
+
+        const uint32_t call_id = in_len >= 16 ? get_le32(in + 12) : 0;
+
+        out.clear();
+        // ---- 16 字节公共头 ----
+        out.push_back(5);  // rpc_vers
+        out.push_back(0);  // rpc_vers_minor
+        out.push_back(DCE_PDU_BIND_ACK);
+        out.push_back(DCE_PFC_FIRST_LAST);
+        out.push_back(DCE_DR_LE);
+        out.push_back(0);  // flags
+        pad4(out);         // 实际上 out 已经是 8 字节
+        out.resize(8, 0);
+        // frag_length 占位，最后回填
+        const size_t frag_len_pos = out.size();
+        put_le16(out, 0);
+        // auth_length = 0
+        put_le16(out, 0);
+        put_le32(out, call_id);
+
+        // ---- BIND_ACK 体 ----
+        put_le16(out, 4280);  // max_xmit_frag
+        put_le16(out, 4280);  // max_recv_frag
+        put_le32(out, 0);     // assoc_group_id
+        put_le16(out, sec_len);
+        out.insert(out.end(), sec_addr, sec_addr + sec_len);
+        pad4(out);
+        out.push_back(1);  // num_results
+        out.push_back(0);  // 对齐
+        out.push_back(0);
+        out.push_back(0);
+        put_le16(out, DCE_ACK_ACCEPT);  // ack_result
+        put_le16(out, 0);               // ack_reason
+        out.insert(out.end(), ndr32_uuid, ndr32_uuid + 16);
+        put_le32(out, 2);  // transfer syntax 版本
+
+        // 回填 frag_length
+        const uint16_t fl = (uint16_t)out.size();
+        out[frag_len_pos] = (uint8_t)(fl & 0xff);
+        out[frag_len_pos + 1] = (uint8_t)(fl >> 8);
+    }
+
+    /**
+     * 回应 NetrShareEnum REQUEST：手工编码整个响应体。
+     *
+     * 头部原样回填 call_id 和 context_id，PDU 类型置为 RESPONSE。
+     */
+    static void build_share_enum_response(
+        const uint8_t *in, uint32_t in_len,
+        const std::vector<std::pair<std::string, std::string>> &shares,
+        std::vector<uint8_t> &out) {
+        const uint32_t call_id = get_le32(in + 12);
+        const uint16_t context_id = get_le16(in + 20);
+
+        // 先编码 stub，再套 DCE 头，方便最后回填长度
+        std::vector<uint8_t> stub;
+        encode_share_enum_reply(shares, stub);
+
+        out.clear();
+        out.push_back(5);
+        out.push_back(0);
+        out.push_back(DCE_PDU_RESPONSE);
+        out.push_back(DCE_PFC_FIRST_LAST);
+        out.push_back(DCE_DR_LE);
+        out.push_back(0);
+        out.resize(8, 0);
+        const size_t frag_len_pos = out.size();
+        put_le16(out, 0);              // frag_length 占位
+        put_le16(out, 0);              // auth_length
+        put_le32(out, call_id);
+        put_le32(out, (uint32_t)stub.size());  // alloc_hint
+        put_le16(out, context_id);
+        out.push_back(0);  // cancel_count
+        out.push_back(0);  // 保留
+        out.insert(out.end(), stub.begin(), stub.end());
+
+        const uint16_t fl = (uint16_t)out.size();
+        out[frag_len_pos] = (uint8_t)(fl & 0xff);
+        out[frag_len_pos + 1] = (uint8_t)(fl >> 8);
+    }
+
+    /**
+     * srvsvc 管道上的一个 DCE/RPC PDU 入口。
+     *
+     * 只处理 BIND 和 NetrShareEnum，其它一律返回 false，由调用方决定如何回应。
+     */
+    static bool srvsvc_process(const uint8_t *in, uint32_t in_len,
+                               std::vector<uint8_t> &out) {
+        if (in == NULL || in_len < 16) {
+            return false;
+        }
+        // 只认 DCE/RPC 5.0
+        if (in[0] != 5) {
+            return false;
+        }
+        switch (in[2]) {
+            case DCE_PDU_BIND:
+                build_bind_ack(in, in_len, out);
+                return true;
+            case DCE_PDU_REQUEST:
+                // REQUEST 的 opnum 在偏移 22
+                if (in_len < 24 ||
+                    get_le16(in + 22) != SRVSVC_OPNUM_SHARE_ENUM) {
+                    return false;
+                }
+                build_share_enum_response(in, in_len,
+                                          self_ ? self_->shares()
+                                                : std::vector<std::pair<
+                                                      std::string, std::string>>(),
+                                          out);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+
+    /**
+     * NetrShareEnum 的响应体手工编码（NDR32）。
+     *
+     * 为什么不用 libdcerpc 的 srvsvc coder：
+     * dcerpc_ptr_coder 对 PTR_UNIQUE / PTR_REF 一律写入 UPTR / RPTR 占位
+     * 标记（见 libdcerpc/dcerpc.c "stand out in a hexdump" 的注释），
+     * 只有在 pdu->top_level 时才回填，嵌套指针永远不会回填真实 referent id。
+     * 自家客户端与编码端共用同一实现所以互通，但真实 SMB 客户端
+     * （iOS 文件类 App、Windows）按标准 NDR 解析会拿到 0x55707472 这种
+     * 非法 referent id，随后直接断开。
+     * 这里按 [MS-SRVS] 3.1.4.8 / [C706] 14.3 的线格式手工编码。
+     */
+    static void encode_share_enum_reply(
+        const std::vector<std::pair<std::string, std::string>> &shares,
+        std::vector<uint8_t> &out) {
+        const uint32_t count = (uint32_t)shares.size();
+
+        // referent id 从 1 开始递增，NDR 要求非 0 且唯一，且按出现顺序编排：
+        //   1: SHARE_ENUM_UNION 的 Level1（SHARE_INFO_1_CONTAINER）
+        //   2: Level1.Buffer（SHARE_INFO_1 数组）
+        //   3..: 每个条目的 name / comment
+        uint32_t next_ref = 1;
+        const uint32_t ref_array = next_ref++;
+        const uint32_t ref_elements = next_ref++;
+        std::vector<uint32_t> ref_names(count), ref_remarks(count);
+        for (uint32_t i = 0; i < count; i++) {
+            ref_names[i] = next_ref++;
+            ref_remarks[i] = next_ref++;
+        }
+
+        // 逐字段写入的小工具：统一做 4 字节对齐
+        auto put32 = [&out](uint32_t v) {
+            out.push_back((uint8_t)(v & 0xff));
+            out.push_back((uint8_t)((v >> 8) & 0xff));
+            out.push_back((uint8_t)((v >> 16) & 0xff));
+            out.push_back((uint8_t)((v >> 24) & 0xff));
+        };
+        auto align4 = [&out]() {
+            while (out.size() & 3) {
+                out.push_back(0);
+            }
+        };
+        // [string] 在 NDR 里是 unique pointer 指向的 conformant varying
+        // 数组：MaximumCount + Offset + ActualCount + UTF-16LE 字符 + 结束符
+        auto put_utf16_string = [&](const std::string &s) {
+            align4();
+            // 字符串先转成 UTF-16LE；这里共享名与备注都是 ASCII/UTF-8，
+            // 逐字节提升为 UTF-16 即可覆盖文件名场景
+            std::vector<uint16_t> w;
+            for (unsigned char ch : s) {
+                w.push_back((uint16_t)ch);
+            }
+            const uint32_t n = (uint32_t)w.size();
+            put32(n + 1);  // MaximumCount
+            put32(0);      // Offset
+            put32(n + 1);  // ActualCount
+            for (uint16_t ch : w) {
+                out.push_back((uint8_t)(ch & 0xff));
+                out.push_back((uint8_t)(ch >> 8));
+            }
+            out.push_back(0);  // 结束符
+            out.push_back(0);
+        };
+
+        // ---- srvsvc_NetShareInfoCtr ----
+        // 布局以 libsmb2 自带的解析器（lib/smb2-share-enum.c 的
+        // se_decode_stub）为准，它按如下顺序读取：
+        //   level, sw, ctr_ref, count, buf_ref, max_count, entries...
+        put32(1);  // level = 1
+
+        // sw：switch 值，解析器要求它等于 level
+        put32(1);
+
+        // ctr_ref：指向 SHARE_INFO_1_CONTAINER 的指针
+        put32(count ? ref_array : 0);
+        if (count) {
+            // ---- SHARE_INFO_1_CONTAINER ----
+            put32(count);  // count（EntriesRead）
+            // buf_ref：指向 SHARE_INFO_1 数组的指针
+            put32(ref_elements);
+            // conformant 数组只有 MaximumCount
+            align4();
+            put32(count);  // MaximumCount
+            // 数组元素：[MS-SRVS] 2.2.4.1 srvsvc_NetShareInfo1 的字段顺序是
+            //   [string] name, ShareType type, [string] comment
+            // type 夹在两个字符串指针中间，顺序错了客户端直接解析失败。
+            for (uint32_t i = 0; i < count; i++) {
+                align4();
+                put32(ref_names[i]);
+                put32(SRVSVC_STYPE_DISKTREE);
+                put32(ref_remarks[i]);
+            }
+            // 元素数据按出现顺序紧接其后
+            for (uint32_t i = 0; i < count; i++) {
+                put_utf16_string(shares[i].first);
+                put_utf16_string(shares[i].second);
+            }
+        }
+
+        // ---- TotalEntries ----
+        // 客户端按直接取值解析（smb2-share-enum.c 的 ndr_u32(&total)），
+        // 不先读指针，所以这里直接写数值。
+        align4();
+        put32(count);
+
+        // ---- ResumeHandle：[in,out,unique]，0 表示 NULL，没有后续 ----
+        put32(0);
+
+        // ---- Status ----
+        put32(SRVSVC_STATUS_SUCCESS);
+    }
+
+    /**
+     * srvsvc 的 NetrShareEnum stub。
+     *
+     * 返回已编码的响应体给 ioctl_cmd，由它写进 FSCTL_PIPE_TRANSCEIVE 的
+     * 输出缓冲区；不再经过 libdcerpc 的 srvsvc coder。
+     */
+    static int srvsvc_netr_share_enum_stub(struct dcerpc_context *dce,
+                                           struct dcerpc_pdu *pdu,
+                                           void *req, void *rep) {
+        auto *r = (struct srvsvc_NetrShareEnum_req *)req;
+        (void)rep;
+        if (r == NULL || self_ == nullptr) {
+            return -1;
+        }
+        // 只实现 Level 1
+        if (r->InfoStruct.Level != 1) {
+            return -1;
+        }
+
+        // 编码结果暂存在实例上，由 ioctl_cmd 取走后清空
+        const std::vector<std::pair<std::string, std::string>> shares =
+            self_->shares();
+        encode_share_enum_reply(shares, self_->srvsvc_reply_);
+
+        // 让 runtime 认为 stub 成功，但没有 rep 数据要编码
+        self_->srvsvc_reply_ready_ = true;
+        return 0;
+    }
+
 
     // 统一入口：构造 Smb2Req → CallJs → 读结果
     static bool call(Smb2Server *self, Smb2Req &req) {
@@ -84,14 +420,18 @@ struct ServerHandlers {
                                             (cc[2] << 16) | (cc[3] << 24));
                 uint16_t noff = (uint16_t)(cc[4] | (cc[5] << 8));
                 uint16_t nlen = (uint16_t)(cc[6] | (cc[7] << 8));
-                // FILE_OPEN_BY_FILE_ID 的 tag 是 10 字节 "FileId:   "
-                if (nlen >= 10 && (size_t)noff + nlen <= left &&
-                    memcmp(cc + noff, "FileId:   ", 10) == 0) {
+                // FILE_OPEN_BY_FILE_ID 的 context Name 为空，Data 是紧跟
+                // 12 字节头之后的 16 字节 FileId。之前读 cc+8 会落在
+                // Reserved 字段里，取到的是错误句柄。
+                if (nlen == 0 && left >= 12 + SMB2_FD_SIZE) {
                     smb2_file_id fid;
                     memset(fid, 0, SMB2_FD_SIZE);
-                    memcpy(fid, cc + 8, SMB2_FD_SIZE);
+                    memcpy(fid, cc + 12, SMB2_FD_SIZE);
                     std::string by_id_path;
-                    if (self_->get_handle(file_id_to_handle(fid), &by_id_path)) {
+                    const uint64_t want = file_id_to_handle(fid);
+                    // 先查 create/close 生命周期的 handle，再查目录项 id
+                    if (self_->get_handle(want, &by_id_path) ||
+                        self_->get_dir_entry_path(want, &by_id_path)) {
                         req_name = by_id_path;
                     }
                     break;
@@ -129,18 +469,23 @@ struct ServerHandlers {
         }
 
         if (self_->is_ipc_tree(smb2) || name_is_pipe) {
-            // 只实现 srvsvc（共享枚举）；其它管道一律以 OBJECT_NAME_NOT_FOUND
-            // 拒绝，客户端会退回只用磁盘共享，不会因此断开连接
-            if (lower != "srvsvc") {
+            // IPC$ 上的命名管道：只要是已知管道名就允许打开，返回一个管道句柄。
+            // 之前对非 srvsvc 的管道直接返回 ENOENT，会让客户端（iOS 文件类
+            // App 等）判定整个 IPC$ 共享不可用而放弃共享枚举。
+            // 真正的功能限制放在 ioctl 阶段：只有 srvsvc 支持 PIPE_TRANSCEIVE，
+            // 其它管道在 transceive 时返回 NOT_SUPPORTED 即可。
+            if (!name_is_pipe) {
                 return -ENOENT;
             }
-            uint64_t ph = self_->add_pipe_handle("srvsvc");
+            uint64_t ph = self_->add_pipe_handle(lower);
             handle_to_file_id(ph, rep->file_id);
             self_->set_last_file_id(smb2, rep->file_id);
             rep->oplock_level = 0;
             rep->flags = 0;
             rep->file_attributes = SMB2_FILE_ATTRIBUTE_NORMAL;
-            rep->create_action = 2;
+            // 命名管道是“打开已有对象”，对应 FILE_OPEN；
+            // 之前给 2(FILE_CREATE) 会让客户端认为要求新建管道而判定不存在。
+            rep->create_action = SMB2_FILE_OPEN;
             rep->end_of_file = 0;
             rep->allocation_size = 0;
             rep->create_context_length = 0;
@@ -267,7 +612,9 @@ struct ServerHandlers {
             rep->share_type = SMB2_SHARE_TYPE_PIPE;
             rep->share_flags = 0;
             rep->capabilities = 0;
-            rep->maximal_access = 0x001f01ff;
+            // 与 libsmb2 官方示例 examples/smb2-server-sync.c 保持一致：
+            // IPC$ 的 maximal_access 是 0x1f00a9，不是磁盘共享的 0x101f01ff。
+            rep->maximal_access = 0x1f00a9;
             return 0;
         }
         // 磁盘共享：req->path 是 UTF-16LE，形如 \\server\share，
@@ -323,6 +670,11 @@ struct ServerHandlers {
     static int session_established_cmd(struct smb2_server *srvr, struct smb2_context *smb2) {
         // 返回 0 表示会话建立成功；不实现这个 handler 时服务端会回
         // STATUS_NOT_IMPLEMENTED，客户端收到后直接断开。
+        //
+        // 会话建立后立即开启 passthrough：ioctl 的 input、set_info 的
+        // 变长缓冲区（rename/disposition）都依赖它才会被填进 req->input，
+        // 否则这些字段全是 NULL，管道 transceive（srvsvc 共享枚举）无法工作。
+        smb2_set_passthrough(smb2, 1);
         return 0;
     }
 
@@ -359,6 +711,16 @@ struct ServerHandlers {
         // 这里显式设为 1 保持全局状态可预期
         smb2_set_passthrough(smb2, 1);
         uint64_t h = file_id_to_handle(req->file_id);
+        std::string pipe_name;
+        if (self_->get_pipe_name(h, &pipe_name)) {
+            // IPC$ 上的命名管道（srvsvc 等）：服务端尚未实现 DCE/RPC，
+            // 这里返回 0 字节而不是 ENOENT，避免客户端一直等待响应而超时。
+            rep->data_remaining = 0;
+            rep->data = nullptr;
+            rep->data_length = 0;
+            rep->data_offset = 0;
+            return 0;
+        }
         std::string path;
         if (!self_->get_handle(h, &path)) {
             return -ENOENT;
@@ -403,6 +765,12 @@ struct ServerHandlers {
         // queryDirectory 为避免结构体内存外泄会把它关掉，这里补回来
         smb2_set_passthrough(smb2, 1);
         uint64_t h = file_id_to_handle(req->file_id);
+        std::string pipe_name;
+        if (self_->get_pipe_name(h, &pipe_name)) {
+            // 命名管道的写请求由 ioctl 的 PIPE_TRANSCEIVE 处理，这里直接吞掉
+            rep->count = req->length;
+            return 0;
+        }
         std::string path;
         if (!self_->get_handle(h, &path)) {
             return -ENOENT;
@@ -429,6 +797,42 @@ struct ServerHandlers {
         rep->count = req->length;
         rep->remaining = 0;
         return 0;
+    }
+
+    static int flush_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
+                         struct smb2_flush_request *req) {
+        // flush 只是让服务端把缓存写盘，本地文件系统写入即落地，直接成功
+        return 0;
+    }
+
+    /// @brief 连接保活探测，原样回显即可 | keep-alive probe, just echo back
+    static int echo_cmd(struct smb2_server *srvr, struct smb2_context *smb2) {
+        return 0;
+    }
+
+    /// @brief 会话登出，客户端主动断开前的收尾 | session logoff
+    static int logoff_cmd(struct smb2_server *srvr, struct smb2_context *smb2) {
+        return 0;
+    }
+
+    /// @brief 文件区间锁，本地共享场景直接视为成功 | byte-range lock
+    static int lock_cmd(struct smb2_server *srvr, struct smb2_context *smb2,
+                        struct smb2_lock_request *req) {
+        return 0;
+    }
+
+    /// @brief 取消先前请求，直接回复空应答避免客户端一直等待 | cancel
+    static int cancel_cmd(struct smb2_server *srvr, struct smb2_context *smb2) {
+        return 0;
+    }
+
+    /// @brief 目录变更通知：本地共享不做推送，回 STATUS_NOT_SUPPORTED
+    ///        让客户端退回到轮询，而不是一直挂着等待 | change notify
+    static int change_notify_cmd(struct smb2_server *srvr,
+                                 struct smb2_context *smb2,
+                                 struct smb2_change_notify_request *req,
+                                 struct smb2_change_notify_reply *rep) {
+        return -EOPNOTSUPP;
     }
 
     // rename（FILE_RENAME_INFORMATION）与截断（END_OF_FILE）
@@ -704,7 +1108,6 @@ struct ServerHandlers {
         uint64_t h = resolve_handle(self_, smb2, req->file_id);
         std::string pipe_name;
         if (!self_->get_pipe_name(h, &pipe_name)) {
-            // 非命名管道上的 ioctl 返回错误会让客户端放弃整个连接
             return 0;
         }
         if (req->ctl_code != SMB2_FSCTL_PIPE_TRANSCEIVE) {
@@ -715,38 +1118,23 @@ struct ServerHandlers {
         }
 
         std::lock_guard<std::mutex> guard(self_->rpc_mutex_);
-        if (self_->rpc_ == NULL) {
-            return -ENOMEM;
-        }
-        struct dcerpc_server_pipe *pipe = self_->rpc_pipes_[h];
-        if (pipe == NULL) {
-            pipe = dcerpc_server_pipe_create(self_->rpc_, NULL);
-            if (pipe == NULL) {
-                return -ENOMEM;
-            }
-            self_->rpc_pipes_[h] = pipe;
+        if (req->input == NULL || req->input_count < 16) {
+            return -EINVAL;
         }
 
-        // 客户端写入的字节原样交给 runtime
-        if (req->input != NULL && req->input_count > 0) {
-            if (dcerpc_server_pipe_write(pipe, (const uint8_t *)req->input,
-                                         req->input_count) != 0) {
-                return -EINVAL;
-            }
-        }
+        // srvsvc 的 DCE/RPC 由这里直接处理：
+        // BIND 回 BIND_ACK，REQUEST 调 NetrShareEnum 并手工编码响应。
+        // 不经过 libdcerpc runtime，因为它对嵌套指针只写 UPTR/RPTR 占位，
+        // 真实 SMB 客户端解析不了（详见 encode_share_enum_reply 的说明）。
+        const uint8_t *in = (const uint8_t *)req->input;
+        const uint32_t in_len = req->input_count;
+        self_->srvsvc_reply_.clear();
+        self_->srvsvc_reply_ready_ = false;
 
-        // 取走 runtime 已排队的输出
         std::vector<uint8_t> out;
-        int more = 0;
-        do {
-            uint8_t tmp[65536];
-            size_t got = dcerpc_server_pipe_read(pipe, tmp, sizeof(tmp), &more);
-            if (got == 0) {
-                break;
-            }
-            out.insert(out.end(), tmp, tmp + got);
-        } while (more);
-
+        if (!srvsvc_process(in, in_len, out)) {
+            return -EINVAL;
+        }
         if (out.empty()) {
             return 0;
         }
@@ -786,7 +1174,6 @@ struct ServerHandlers {
         r.pattern = req->name ? req->name : "*";
         r.index = req->file_index;
         r.buffer_length = req->output_buffer_length;
-
         if (!call(self_, r)) {
             return -1;
         }
@@ -803,19 +1190,21 @@ struct ServerHandlers {
         }
 
         size_t n = r.out_entries.size();
-        // libsmb2 的 smb2_encode_query_directory_reply 在非 passthrough 模式下
-        // 把 output_buffer 当作「结构体数组」按 PAD_TO_64BIT(sizeof(struct))
-        // 定长步进读取，name 走独立指针，线上布局由它自己拼装。
-        // 因此这里只要按结构体大小分配数组，并填好 name 指针即可。
-        size_t bytes = sizeof(struct smb2_fileidbothdirectoryinformation) * n;
-        struct smb2_fileidbothdirectoryinformation *arr =
-            (struct smb2_fileidbothdirectoryinformation *)calloc(1, bytes);
+        // libsmb2 的 smb2_encode_query_directory_reply 不管客户端请求哪个 info_class，
+        // 都固定把 output_buffer 强转成 struct smb2_fileidbothdirectoryinformation
+        // 并按 PAD_TO_64BIT(sizeof(该结构体)) 步进读取；info_class 只影响
+        // 它计算线上条目大小用的 fixed 值。因此这里必须统一按 fileidboth 结构体
+        // 排布数组，slot 也用它的 sizeof，否则会错位或越界。
+        const size_t slot = PAD_TO_64BIT(sizeof(struct smb2_fileidbothdirectoryinformation));
+        size_t bytes = slot * n;
+        auto *arr = (struct smb2_fileidbothdirectoryinformation *)calloc(1, bytes);
         if (arr == NULL) {
             return -ENOMEM;
         }
         for (size_t i = 0; i < n; i++) {
             const Smb2Req::DirEntry &e = r.out_entries[i];
-            struct smb2_fileidbothdirectoryinformation *d = &arr[i];
+            struct smb2_fileidbothdirectoryinformation *d =
+                (struct smb2_fileidbothdirectoryinformation *)(void *)((uint8_t *)arr + i * slot);
             d->file_index = (uint32_t)(h + i);
             d->creation_time.tv_sec = (time_t)e.mtime;
             d->last_access_time.tv_sec = (time_t)e.mtime;
@@ -823,19 +1212,20 @@ struct ServerHandlers {
             d->change_time.tv_sec = (time_t)e.mtime;
             d->end_of_file = e.is_dir ? 0 : e.size;
             d->allocation_size = e.is_dir ? 0 : e.size;
-            d->file_attributes = e.is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
-                                          : (SMB2_FILE_ATTRIBUTE_ARCHIVE |
-                                             SMB2_FILE_ATTRIBUTE_NORMAL);
+            d->file_attributes = e.is_dir
+                ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
             d->file_name_length = (uint32_t)e.name.size() * 2;
-            // Windows 会拿列表里的 file_id 直接发 FILE_OPEN_BY_FILE_ID 来打开文件，
-            // 所以这里必须是「指向该条目真实路径」的句柄，不能用父句柄或编造值，
-            // 否则后续打开/删除等操作全部失败。
+            // file_id 必须指向该条目的真实路径：Windows/iOS 拿到列表后
+            // 会用这个 id 直接发 FILE_OPEN_BY_FILE_ID 打开文件。
             std::string child = path;
             if (!child.empty() && child.back() != '/' && child.back() != '\\') {
                 child += '/';
             }
             child += e.name;
-            d->file_id = self_->add_handle(child);
+            // 用稳定的目录项 id，而不是每次新建 handle：
+            // 目录项不经过 create/close，用 add_handle 会持续泄漏。
+            d->file_id = self_->dir_entry_file_id(child);
             d->name = strdup(e.name.c_str());
         }
         rep->output_buffer = (uint8_t *)arr;
@@ -852,6 +1242,9 @@ struct ServerHandlers {
         // 直接强转成对应的 C 结构体再序列化，所以这里必须填结构体，
         // 不能填“已编码好的线上字节”，否则会被当成结构体解析并崩溃。
         static const uint8_t fs_name[] = {'N', 0, 'T', 0, 'F', 0, 'S', 0};
+        // 卷标用 UTF-16LE 编码，内容为 "filecat"
+        static const uint8_t volume_label[] = {
+            'f', 0, 'i', 0, 'l', 0, 'e', 0, 'c', 0, 'a', 0, 't', 0};
 
         // 与 queryDirectory 同理：query_info 的 output_buffer 也是 C 结构体，
         // passthrough 模式下会被原样 memcpy 出去
@@ -887,6 +1280,51 @@ struct ServerHandlers {
                 si->bytes_per_sector = (uint32_t)unit;
                 rep->output_buffer = (uint8_t *)si;
                 rep->output_buffer_length = sizeof(*si);
+                return 0;
+            }
+            // 卷标：部分客户端（iOS 文件类 App）连接时会查询，缺失会导致 NOT_IMPLEMENTED
+            if (req->file_info_class == SMB2_FILE_FS_VOLUME_INFORMATION) {
+                struct smb2_file_fs_volume_info *vi =
+                    (struct smb2_file_fs_volume_info *)calloc(1, sizeof(*vi));
+                if (vi == NULL) {
+                    return -ENOMEM;
+                }
+                vi->volume_serial_number = 0x12345678;
+                vi->supports_objects = 0;
+                vi->volume_label_length = sizeof(volume_label);
+                vi->volume_label = volume_label;
+                rep->output_buffer = (uint8_t *)vi;
+                rep->output_buffer_length = sizeof(*vi);
+                return 0;
+            }
+            // 设备类型：标识为磁盘设备，部分客户端用来区分共享类型
+            if (req->file_info_class == SMB2_FILE_FS_DEVICE_INFORMATION) {
+                struct smb2_file_fs_device_info *di =
+                    (struct smb2_file_fs_device_info *)calloc(1, sizeof(*di));
+                if (di == NULL) {
+                    return -ENOMEM;
+                }
+                di->device_type = FILE_DEVICE_DISK;
+                di->characteristics = 0;
+                rep->output_buffer = (uint8_t *)di;
+                rep->output_buffer_length = sizeof(*di);
+                return 0;
+            }
+            // 完整容量信息：结构与 SIZE_INFORMATION 相同，额外带 sector 大小
+            if (req->file_info_class == SMB2_FILE_FS_FULL_SIZE_INFORMATION) {
+                struct smb2_file_fs_full_size_info *fi =
+                    (struct smb2_file_fs_full_size_info *)calloc(1, sizeof(*fi));
+                if (fi == NULL) {
+                    return -ENOMEM;
+                }
+                const uint64_t unit = 4096;
+                fi->total_allocation_units = (uint64_t)(1ULL << 40) / unit;
+                fi->caller_available_allocation_units = fi->total_allocation_units;
+                fi->actual_available_allocation_units = fi->total_allocation_units;
+                fi->sectors_per_allocation_unit = 1;
+                fi->bytes_per_sector = (uint32_t)unit;
+                rep->output_buffer = (uint8_t *)fi;
+                rep->output_buffer_length = sizeof(*fi);
                 return 0;
             }
             return -EOPNOTSUPP;
@@ -984,6 +1422,37 @@ struct ServerHandlers {
             return 0;
         }
 
+        // FILE_ATTRIBUTE_TAG_INFORMATION：iOS / macOS 客户端在 create 之后
+        // 用它判断目标是否为重解析点（符号链接/快捷方式），缺失会让客户端
+        // 整个操作以 STATUS_NOT_IMPLEMENTED 失败。
+        if (req->info_type == SMB2_0_INFO_FILE &&
+            req->file_info_class == SMB2_FILE_ATTRIBUTE_TAG_INFORMATION) {
+            Smb2Req r;
+            r.op = "queryInfo";
+            r.share = self_->disk_share(smb2);
+            r.path = path;
+            r.handle_id = h;
+            if (!call(self_, r)) {
+                return -1;
+            }
+            if (r.err != 0) {
+                return r.err;
+            }
+            struct smb2_file_attribute_tag_info *ati =
+                (struct smb2_file_attribute_tag_info *)calloc(1, sizeof(*ati));
+            if (ati == NULL) {
+                return -ENOMEM;
+            }
+            ati->file_attributes =
+                r.out_is_dir ? SMB2_FILE_ATTRIBUTE_DIRECTORY
+                             : (SMB2_FILE_ATTRIBUTE_ARCHIVE | SMB2_FILE_ATTRIBUTE_NORMAL);
+            // 不是重解析点，reparse_tag 固定为 0
+            ati->reparse_tag = 0;
+            rep->output_buffer = (uint8_t *)ati;
+            rep->output_buffer_length = sizeof(*ati);
+            return 0;
+        }
+
         // FILE_BASIC_INFORMATION：属性框的时间与属性列
         if (req->info_type == SMB2_0_INFO_FILE &&
             req->file_info_class == SMB2_FILE_BASIC_INFORMATION) {
@@ -1015,6 +1484,7 @@ struct ServerHandlers {
             return 0;
         }
 
+
         return -EOPNOTSUPP;
     }
 };
@@ -1023,32 +1493,30 @@ Smb2Server *ServerHandlers::self_ = nullptr;
 
 // srvsvc 的 stub 表：opnum -> 业务函数。放在类外，Start() 与 ServerHandlers 都能用。
 static const struct dcerpc_stub g_srvsvc_stubs[] = {
-    {SRVSVC_NETRSHAREENUM,     (char *)"NetrShareEnum",     ServerHandlers::srvsvc_NetrShareEnum_stub},
-    {SRVSVC_NETRSHAREGETINFO,  (char *)"NetrShareGetInfo",  ServerHandlers::srvsvc_NetrShareGetInfo_stub},
-    {SRVSVC_NETRSERVERGETINFO, (char *)"NetrServerGetInfo", ServerHandlers::srvsvc_NetrServerGetInfo_stub},
-    {0, NULL, NULL}
-};
+    {SRVSVC_NETRSHAREENUM, (char *)"NetrShareEnum",
+     ServerHandlers::srvsvc_netr_share_enum_stub},
+    {0, NULL, NULL}};
 
 static struct smb2_server_request_handlers g_handlers = {
     nullptr,                              // destruction_event
     ServerHandlers::authorize,            // authorize_user
     ServerHandlers::session_established_cmd,  // session_established
-    nullptr,                              // logoff_cmd
+    ServerHandlers::logoff_cmd,               // logoff_cmd
     ServerHandlers::tree_connect_cmd,     // tree_connect_cmd
     ServerHandlers::tree_disconnect_cmd,  // tree_disconnect_cmd
     ServerHandlers::create_cmd,           // create_cmd
     ServerHandlers::close_cmd,            // close_cmd
-    nullptr,                              // flush_cmd
+    ServerHandlers::flush_cmd,             // flush_cmd
     ServerHandlers::read_cmd,             // read_cmd
     ServerHandlers::write_cmd,            // write_cmd
     nullptr,                              // oplock_break_cmd
     nullptr,                              // lease_break_cmd
-    nullptr,                              // lock_cmd
+    ServerHandlers::lock_cmd,             // lock_cmd
     ServerHandlers::ioctl_cmd,            // ioctl_cmd
-    nullptr,                              // cancel_cmd
-    nullptr,                              // echo_cmd
+    ServerHandlers::cancel_cmd,           // cancel_cmd
+    ServerHandlers::echo_cmd,             // echo_cmd
     ServerHandlers::query_directory_cmd,  // query_directory_cmd
-    nullptr,                              // change_notify_cmd
+    ServerHandlers::change_notify_cmd,    // change_notify_cmd
     ServerHandlers::query_info_cmd,       // query_info_cmd
     ServerHandlers::set_info_cmd,          // set_info_cmd
 };
@@ -1181,19 +1649,9 @@ Napi::Value Smb2Server::Start(const Napi::CallbackInfo &info) {
 
     ServerHandlers::self_ = this;
 
-    // srvsvc 共享枚举：绑定 libdcerpc 官方服务端 runtime
-    if (rpc_ == NULL) {
-        rpc_ = dcerpc_server_create("srvsvc");
-        if (rpc_ == NULL) {
-            throw Napi::Error::New(env, "创建 DCE/RPC 服务端失败");
-        }
-        if (dcerpc_server_add_interface(rpc_, &srvsvc_interface, srvsvc_procs,
-                                        g_srvsvc_stubs, DCERPC_SERVER_ALL_NDR) != 0) {
-            dcerpc_server_destroy(rpc_);
-            rpc_ = NULL;
-            throw Napi::Error::New(env, "注册 srvsvc 接口失败");
-        }
-    }
+    // srvsvc 共享枚举：绑定 libdcerpc 官方服务端 runtime。
+    // 只在服务线程里创建（见 ServeLoop），避免 Start 与 ServeLoop 各建一份
+    // 造成指针被覆盖、旧的 dcerpc_server 泄漏。
     running_ = true;
 
     thread_ = std::thread([this]() { ServeLoop(); });
@@ -1207,20 +1665,61 @@ Napi::Value Smb2Server::Start(const Napi::CallbackInfo &info) {
 }
 
 void Smb2Server::ServeLoop() {
+    // 建立 srvsvc 的 DCE/RPC 服务端端点：客户端在 IPC$ 上打开 srvsvc 管道后，
+    // BIND 与 NetrShareEnum 都由 libdcerpc 的服务端运行时处理。
+    // 没有这个端点时，不填共享名的客户端（iOS 文件类 App）枚举共享会超时。
+    rpc_ = dcerpc_server_create("srvsvc");
+    if (rpc_ != NULL) {
+        if (dcerpc_server_add_interface(rpc_, &srvsvc_interface, srvsvc_procs,
+                                        g_srvsvc_stubs,
+                                        DCERPC_SERVER_ALL_NDR) != 0) {
+//             fprintf(stderr, "[SMB][rpc] srvsvc 接口注册失败\n");
+        }
+    } else {
+//         fprintf(stderr, "[SMB][rpc] srvsvc 端点创建失败，共享枚举不可用\n");
+    }
+
     struct smb2_context *ctx = nullptr;
     int rc = smb2_serve_port(
         &server_, 4,
         [](struct smb2_context *smb2, void *cb_data) {
-            smb2_set_version(smb2, SMB2_VERSION_ANY);
+            // 只协商 SMB 2.0.2：libsmb2 服务端在 2.1 / 3.1.1 下会强制开启签名
+            // （见 libsmb2.c 中 dialect == 0210 / >= 0311 时 will_sign = 1），
+            // 而签名密钥要等 NTLM 认证完成才能派生，导致 session setup 阶段的
+            // 响应签名无效。iOS / macOS 等严格校验签名的客户端会直接断开。
+            // 2.0.2 不在强制签名列表内，可避开该问题。
+            smb2_set_version(smb2, SMB2_VERSION_0202);
             // 开启 passthrough：目录项/文件信息按 wire format 原样收发。
             // 否则 libsmb2 会把我们自己编码的 blob 当成 C 结构体重新解析，
             // 读 fs->name 指针时错乱导致服务端崩溃。
             smb2_set_passthrough(smb2, 1);
+            // 注册错误回调，把 libsmb2 内部的失败原因输出到 stderr，
+            // 否则客户端中途断开时服务端看不到任何线索。
+            smb2_register_error_callback(smb2, [](struct smb2_context *s, const char *err) {
+//                 if (err) {
+//                     fprintf(stderr, "[SMB][error] %s\n", err);
+//                 }
+            });
             auto *p = (struct smb2_context **)cb_data;
             *p = smb2;
         },
         &ctx);
     running_ = false;
+
+    // 服务循环退出后回收 DCE/RPC 端点
+    {
+        std::lock_guard<std::mutex> guard(rpc_mutex_);
+        for (auto &it : rpc_pipes_) {
+            if (it.second != NULL) {
+                dcerpc_server_pipe_destroy(it.second);
+            }
+        }
+        rpc_pipes_.clear();
+        if (rpc_ != NULL) {
+            dcerpc_server_destroy(rpc_);
+            rpc_ = NULL;
+        }
+    }
 }
 
 Napi::Value Smb2Server::Stop(const Napi::CallbackInfo &info) {
@@ -1229,14 +1728,6 @@ Napi::Value Smb2Server::Stop(const Napi::CallbackInfo &info) {
         thread_.join();
     }
     running_ = false;
-    if (rpc_ != NULL) {
-        for (auto &it : rpc_pipes_) {
-            dcerpc_server_pipe_destroy(it.second);
-        }
-        rpc_pipes_.clear();
-        dcerpc_server_destroy(rpc_);
-        rpc_ = NULL;
-    }
     if (tsfn_) {
         tsfn_.Release();
         tsfn_ = nullptr;

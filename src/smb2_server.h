@@ -127,15 +127,28 @@ private:
     std::map<uint64_t, std::string> handles_;   // handle -> 绝对路径
     uint64_t next_handle_ = 1;
 
+    // 目录枚举的稳定 file id（不参与 create/close 生命周期，不释放）
+    std::mutex dir_ids_mtx_;
+    std::map<std::string, uint64_t> dir_path_to_id_;   // 绝对路径 -> id
+    std::map<uint64_t, std::string> id_to_dir_path_;   // id -> 绝对路径
+    uint64_t next_dir_id_ = 0x4000000000000000ULL;     // 与 handle 区间分开，避免混淆
+
     bool readonly_ = false;
     // 共享名 -> 目录；有序，枚举时保持配置顺序
     std::vector<std::pair<std::string, std::string>> shares_;
     std::string share_remark_ = "FileCat";
 
-    // DCE/RPC 服务端（srvsvc 共享枚举）。非线程安全，全部在服务线程内用。
+    // srvsvc 共享枚举：libdcerpc 的服务端运行时。
+    // 只在服务线程内访问，rpc_mutex_ 防止 Stop 与服务线程竞争。
     struct dcerpc_server *rpc_ = NULL;
     std::map<uint64_t, struct dcerpc_server_pipe *> rpc_pipes_;
     std::mutex rpc_mutex_;
+
+    // srvsvc 响应体：stub 手工编码后放这里，ioctl_cmd 取走写回客户端。
+    // 不用 libdcerpc 的 coder 是因为它对嵌套指针只写 UPTR/RPTR 占位，
+    // 真实 SMB 客户端解析不了。
+    std::vector<uint8_t> srvsvc_reply_;
+    bool srvsvc_reply_ready_ = false;
     // 每个连接当前 tree 对应的共享名
     std::mutex tree_mtx_;
     std::map<struct smb2_context *, std::string> cur_share_;   // IPC$ 标记
@@ -311,6 +324,36 @@ public:
         uint64_t h = next_handle_++;
         handles_[h] = path;
         return h;
+    }
+
+    /*
+     * 目录枚举专用的稳定 file id。
+     * 目录项不经过 create/close 生命周期，如果直接用 add_handle 会在每次
+     * 列目录时给每个条目新建一条 handle 记录且永不释放，memory 会持续增长。
+     * 这里按路径复用同一个 id，既保证 FILE_OPEN_BY_FILE_ID 能反查到路径，
+     * 又不会随列目录次数增加内存。
+     */
+    uint64_t dir_entry_file_id(const std::string &path) {
+        std::lock_guard<std::mutex> lock(dir_ids_mtx_);
+        auto it = dir_path_to_id_.find(path);
+        if (it != dir_path_to_id_.end()) {
+            return it->second;
+        }
+        uint64_t id = next_dir_id_++;
+        dir_path_to_id_[path] = id;
+        id_to_dir_path_[id] = path;
+        return id;
+    }
+
+    /* 目录枚举分配的 id 也能被 FILE_OPEN_BY_FILE_ID 反查到路径 */
+    bool get_dir_entry_path(uint64_t id, std::string *out_path) {
+        std::lock_guard<std::mutex> lock(dir_ids_mtx_);
+        auto it = id_to_dir_path_.find(id);
+        if (it == id_to_dir_path_.end()) {
+            return false;
+        }
+        *out_path = it->second;
+        return true;
     }
 
     bool get_handle(uint64_t h, std::string *out_path) {

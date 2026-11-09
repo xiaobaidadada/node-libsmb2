@@ -127,11 +127,12 @@ class Smb2Server {
     // SMB 认证发生在 session setup 阶段，此时客户端还没说要访问哪个共享，
     // 因此账号是服务级的：一套用户名密码管所有共享。
     // 共享级的差异只体现在「只读」上，由 tree_connect 之后的各操作判断。
+    if (!this._password) {
+      // 未配置密码 = 匿名模式，返回空串让 libsmb2 走 guest 分支
+      return '';
+    }
     const user = String(payload.user || '');
     if (this._username && user !== this._username) {
-      throw new Error('user not found');
-    }
-    if (!this._password) {
       throw new Error('user not found');
     }
     // 返回密码明文，libsmb2 内部用它做 NTLMv2 校验
