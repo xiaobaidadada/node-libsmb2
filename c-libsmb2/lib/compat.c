@@ -25,15 +25,6 @@
 #ifdef _WINDOWS
 #define login_num ENXIO
 #define getpid_num() GetCurrentProcessId()
-/*
- * MSVC has no random()/srandom()/getlogin_r(); enable the portable
- * implementations further down in this file (NEED_RANDOM, NEED_SRANDOM,
- * NEED_GETLOGIN_R, and NEED_GETPID since random() seeds via getpid()).
- */
-#define NEED_RANDOM
-#define NEED_SRANDOM
-#define NEED_GETLOGIN_R
-#define NEED_GETPID
 #else
 #define login_num 0
 #define getpid_num() 0	
@@ -88,7 +79,10 @@ int gethostname(char *name, size_t len)
 #define select(nfds, readfds, writefds, exceptfds, timeout) WaitSelect(nfds, readfds, writefds, exceptfds, timeout, NULL)
 #endif
 #ifdef libnix
-StdFileDes *_lx_fhfromfd(int d) { return NULL; }
+/* stdlib.h used to include stdio.h. It no longer does, so StdFileDes
+   is not declared until stdio.h itself is included. */
+#include <stdio.h>
+__stdargs StdFileDes *_lx_fhfromfd(int d) { return NULL; }
 struct MinList __filelist = { (struct MinNode *) &__filelist.mlh_Tail, NULL, (struct MinNode *) &__filelist.mlh_Head };
 #endif
 #endif
@@ -151,35 +145,91 @@ time_t time(time_t *tloc)
         return sec;
 }
 
+struct prnt_buf {
+        char *str;
+        int len;
+};
+
+/* prnt() also calls this with 0x200 before the first character and 0x201 after the last */
+static void prnt_char(void *context, int c)
+{
+        struct prnt_buf *buf = context;
+
+        if (c == 0x200 || c == 0x201) {
+                return;
+        }
+        if (buf->str) {
+                buf->str[buf->len] = c;
+        }
+        buf->len++;
+}
+
 int asprintf(char **strp, const char *fmt, ...)
 {
-        int len;
-        char *str;
-        va_list args;        
+        struct prnt_buf buf = { NULL, 0 };
+        va_list args;
 
         va_start(args, fmt);
-        str = malloc(256);
-        len = sprintf(str, fmt, args);
+        prnt(prnt_char, &buf, fmt, args);
         va_end(args);
-        *strp = str;
-        return len;
+        buf.str = malloc(buf.len + 1);
+        if (buf.str == NULL) {
+                return -1;
+        }
+        buf.len = 0;
+        va_start(args, fmt);
+        prnt(prnt_char, &buf, fmt, args);
+        va_end(args);
+        buf.str[buf.len] = '\0';
+        *strp = buf.str;
+        return buf.len;
 }
 
 int errno;
 
-int iop_connect(int sockfd, struct sockaddr *addr, socklen_t addrlen)
+/*
+ * lwIP's errno is ps2ip's own and not ours, and SO_ERROR is 0 when a
+ * non-blocking call would have blocked.
+ */
+static int iop_errno(int sockfd, int would_block)
 {
-        int rc;
         int err = 0;
         socklen_t err_size = sizeof(err);
 
-        if ((rc = lwip_connect(sockfd, addr, addrlen)) < 0) {
-                if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR,
-			       (char *)&err, &err_size) != 0 || err != 0) {
-                        errno = err;
-                }
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR,
+                       (char *)&err, &err_size) != 0) {
+                return EIO;
         }
+        return err ? err : would_block;
+}
 
+int iop_connect(int sockfd, struct sockaddr *addr, socklen_t addrlen)
+{
+        int rc;
+
+        if ((rc = lwip_connect(sockfd, addr, addrlen)) < 0) {
+                errno = iop_errno(sockfd, EINPROGRESS);
+        }
+        return rc;
+}
+
+int iop_read(int sockfd, void *buf, size_t len)
+{
+        int rc;
+
+        if ((rc = lwip_recv(sockfd, buf, len, MSG_DONTWAIT)) < 0) {
+                errno = iop_errno(sockfd, EAGAIN);
+        }
+        return rc;
+}
+
+int iop_write(int sockfd, const void *buf, size_t len)
+{
+        int rc;
+
+        if ((rc = lwip_send(sockfd, (void *)buf, len, MSG_DONTWAIT)) < 0) {
+                errno = iop_errno(sockfd, EAGAIN);
+        }
         return rc;
 }
 

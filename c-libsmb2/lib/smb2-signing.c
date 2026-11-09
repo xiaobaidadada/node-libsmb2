@@ -123,12 +123,210 @@ void aes_cmac_sub_keys(
         }
 }
 
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+/* AES-CMAC with the CPU's AES instructions: the key expanded once per message, each block ten
+ * instructions. The portable code below expands the key again for every 16-byte block and runs AES a
+ * byte at a time, which limited a signed SMB3 transfer to a few MB/s on a PS5. Results are the same
+ * (RFC 4493). Used when the compiler targets AES-NI (the PS5's Zen 2) or CPUID reports it. */
+#include <emmintrin.h>
+#include <wmmintrin.h>
+#ifndef __AES__
+#include <cpuid.h>
+#endif
+
+#define SMB2_AESNI __attribute__((target("aes,sse2")))
+
+SMB2_AESNI static __m128i smb2_aesni_expand(__m128i key, __m128i assist)
+{
+        assist = _mm_shuffle_epi32(assist, 0xff);
+        key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+        key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+        key = _mm_xor_si128(key, _mm_slli_si128(key, 4));
+        return _mm_xor_si128(key, assist);
+}
+
+#define SMB2_AESNI_ROUND(i, rcon) \
+        rk[i] = smb2_aesni_expand(rk[i - 1], _mm_aeskeygenassist_si128(rk[i - 1], rcon))
+
+SMB2_AESNI static void smb2_aesni_key(const uint8_t key[16], __m128i rk[11])
+{
+        rk[0] = _mm_loadu_si128((const __m128i *)(const void *)key);
+        SMB2_AESNI_ROUND(1, 0x01);
+        SMB2_AESNI_ROUND(2, 0x02);
+        SMB2_AESNI_ROUND(3, 0x04);
+        SMB2_AESNI_ROUND(4, 0x08);
+        SMB2_AESNI_ROUND(5, 0x10);
+        SMB2_AESNI_ROUND(6, 0x20);
+        SMB2_AESNI_ROUND(7, 0x40);
+        SMB2_AESNI_ROUND(8, 0x80);
+        SMB2_AESNI_ROUND(9, 0x1b);
+        SMB2_AESNI_ROUND(10, 0x36);
+}
+
+SMB2_AESNI static __m128i smb2_aesni_encrypt(__m128i b, const __m128i rk[11])
+{
+        int r;
+
+        b = _mm_xor_si128(b, rk[0]);
+        for (r = 1; r < 10; r++) {
+                b = _mm_aesenc_si128(b, rk[r]);
+        }
+        return _mm_aesenclast_si128(b, rk[10]);
+}
+
+static int smb2_aesni_available(void)
+{
+#ifdef __AES__
+        return 1;
+#else
+        /* contexts on several threads ask at once: every one finds the same
+         * answer, but the cache still has to be atomic */
+        static int known = -1;
+        int v = __atomic_load_n(&known, __ATOMIC_RELAXED);
+        unsigned int a, b, c, d;
+
+        if (v < 0) {
+                v = __get_cpuid(1, &a, &b, &c, &d) && (c & bit_AES) != 0;
+                __atomic_store_n(&known, v, __ATOMIC_RELAXED);
+        }
+        return v;
+#endif
+}
+
+/* the expanded key and CMAC's two subkeys (RFC 4493 2.3) */
+SMB2_AESNI static void smb2_aesni_setup(const uint8_t key[16], __m128i rk[11], uint8_t sub_key1[16],
+                                        uint8_t sub_key2[16])
+{
+        smb2_aesni_key(key, rk);
+        _mm_storeu_si128((__m128i *)(void *)sub_key1, smb2_aesni_encrypt(_mm_setzero_si128(), rk));
+        if (aes_cmac_shift_left(sub_key1)) {
+                sub_key1[15] ^= 0x87;
+        }
+        memcpy(sub_key2, sub_key1, 16);
+        if (aes_cmac_shift_left(sub_key2)) {
+                sub_key2[15] ^= 0x87;
+        }
+}
+
+SMB2_AESNI static void smb2_aesni_cmac(const uint8_t key[16], const uint8_t *msg, uint64_t msg_len,
+                                       uint8_t mac[16])
+{
+        __m128i rk[11];
+        uint8_t sub_key1[16], sub_key2[16], last[16];
+        uint64_t n = (msg_len + 15) / 16;
+        uint64_t rem = msg_len % 16;
+        uint64_t i;
+        int complete = n != 0 && rem == 0;
+        __m128i x;
+
+        smb2_aesni_setup(key, rk, sub_key1, sub_key2);
+        if (n == 0) {
+                n = 1;
+        }
+        x = _mm_setzero_si128();
+        for (i = 0; i < n - 1; i++) {
+                x = smb2_aesni_encrypt(_mm_xor_si128(x, _mm_loadu_si128((const __m128i *)(const void *)(msg + i * 16))), rk);
+        }
+        if (complete) {
+                memcpy(last, msg + i * 16, 16);
+                aes_cmac_xor(last, sub_key1);
+        } else {
+                memcpy(last, msg + i * 16, (size_t)rem);
+                last[rem] = 0x80;
+                memset(last + rem + 1, 0, 16 - ((size_t)rem + 1));
+                aes_cmac_xor(last, sub_key2);
+        }
+        x = smb2_aesni_encrypt(_mm_xor_si128(x, _mm_loadu_si128((const __m128i *)(const void *)last)), rk);
+        _mm_storeu_si128((__m128i *)(void *)mac, x);
+}
+
+#ifndef HAVE_OPENSSL
+/* Copies want bytes of the message from iovec *v at offset *at onwards, crossing into the next iovecs. */
+static void smb2_iov_gather(const struct smb2_iovec *iov, size_t niov, size_t *v, size_t *at, uint8_t *out,
+                            size_t want)
+{
+        while (want > 0 && *v < niov) {
+                size_t take = iov[*v].len - *at;
+
+                if (take > want) {
+                        take = want;
+                }
+                if (take > 0) { /* an empty iovec may have no buffer */
+                        memcpy(out, iov[*v].buf + *at, take);
+                }
+                out += take;
+                want -= take;
+                *at += take;
+                if (*at == iov[*v].len) {
+                        (*v)++;
+                        *at = 0;
+                }
+        }
+}
+
+/* The same CMAC over a message in pieces, without first copying it into one buffer: a signed 1 MB read
+ * or write allocated and copied the whole message for every signature. */
+SMB2_AESNI static void smb2_aesni_cmac_iov(const uint8_t key[16], const struct smb2_iovec *iov, size_t niov,
+                                           uint64_t msg_len, uint8_t mac[16])
+{
+        __m128i rk[11];
+        uint8_t sub_key1[16], sub_key2[16], last[16];
+        uint64_t n = (msg_len + 15) / 16;
+        uint64_t rem = msg_len % 16;
+        uint64_t i;
+        int complete = n != 0 && rem == 0;
+        size_t v = 0, at = 0;
+        __m128i x = _mm_setzero_si128();
+
+        smb2_aesni_setup(key, rk, sub_key1, sub_key2);
+        if (n == 0) {
+                n = 1;
+        }
+        for (i = 0; i < n - 1; i++) {
+                __m128i m;
+
+                while (v < niov && at == iov[v].len) {
+                        v++;
+                        at = 0;
+                }
+                if (v < niov && iov[v].len - at >= 16) {
+                        m = _mm_loadu_si128((const __m128i *)(const void *)(iov[v].buf + at));
+                        at += 16;
+                } else {
+                        uint8_t block[16];
+
+                        smb2_iov_gather(iov, niov, &v, &at, block, 16);
+                        m = _mm_loadu_si128((const __m128i *)(const void *)block);
+                }
+                x = smb2_aesni_encrypt(_mm_xor_si128(x, m), rk);
+        }
+        memset(last, 0, 16);
+        if (complete) {
+                smb2_iov_gather(iov, niov, &v, &at, last, 16);
+                aes_cmac_xor(last, sub_key1);
+        } else {
+                smb2_iov_gather(iov, niov, &v, &at, last, (size_t)rem);
+                last[rem] = 0x80;
+                aes_cmac_xor(last, sub_key2);
+        }
+        x = smb2_aesni_encrypt(_mm_xor_si128(x, _mm_loadu_si128((const __m128i *)(const void *)last)), rk);
+        _mm_storeu_si128((__m128i *)(void *)mac, x);
+}
+#endif /* !HAVE_OPENSSL */
+#endif
+
 void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
                    uint8_t * msg,
                    uint64_t msg_len,
                    uint8_t mac[AES128_KEY_LEN]
                   )
 {
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+        if (smb2_aesni_available()) {
+                smb2_aesni_cmac(key, msg, msg_len, mac);
+                return;
+        }
+#endif
         uint8_t sub_key1[AES128_KEY_LEN] = {0};
         uint8_t sub_key2[AES128_KEY_LEN] = {0};
         uint8_t scratch[AES128_KEY_LEN] = {0};
@@ -166,6 +364,49 @@ void smb3_aes_cmac_128(uint8_t key[AES128_KEY_LEN],
         memcpy(mac, scratch, AES128_KEY_LEN);
 }
 
+#ifdef HAVE_OPENSSL
+#include <openssl/core_names.h>
+#include <openssl/evp.h>
+
+static int smb2_openssl_mac(const char *name, const char *param, const char *value,
+                            const uint8_t key[SMB2_KEY_SIZE], const struct smb2_iovec *iov,
+                            size_t niov, uint8_t mac[32])
+{
+        EVP_MAC *m;
+        EVP_MAC_CTX *ctx = NULL;
+        OSSL_PARAM params[2];
+        size_t i, len;
+        int rc = -1;
+
+        m = EVP_MAC_fetch(NULL, name, NULL);
+        if (m == NULL) {
+                return -1;
+        }
+        ctx = EVP_MAC_CTX_new(m);
+        if (ctx == NULL) {
+                goto out;
+        }
+        params[0] = OSSL_PARAM_construct_utf8_string(param, (char *)value, 0);
+        params[1] = OSSL_PARAM_construct_end();
+        if (EVP_MAC_init(ctx, key, SMB2_KEY_SIZE, params) != 1) {
+                goto out;
+        }
+        for (i = 0; i < niov; i++) {
+                if (iov[i].len && EVP_MAC_update(ctx, iov[i].buf, iov[i].len) != 1) {
+                        goto out;
+                }
+        }
+        if (EVP_MAC_final(ctx, mac, &len, 32) != 1) {
+                goto out;
+        }
+        rc = 0;
+ out:
+        EVP_MAC_CTX_free(ctx);
+        EVP_MAC_free(m);
+        return rc;
+}
+#endif
+
 int
 smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                     struct smb2_iovec *iov, size_t niov)
@@ -174,6 +415,26 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
         /* Clear the smb2 header signature field field */
         memset(iov[0].buf + 48, 0, 16);
 
+#ifdef HAVE_OPENSSL
+        {
+                uint8_t mac[32];
+                int rc;
+
+                if (smb2->dialect > SMB2_VERSION_0210) {
+                        rc = smb2_openssl_mac(OSSL_MAC_NAME_CMAC, OSSL_MAC_PARAM_CIPHER, "AES-128-CBC",
+                                              smb2->signing_key, iov, niov, mac);
+                } else {
+                        rc = smb2_openssl_mac(OSSL_MAC_NAME_HMAC, OSSL_MAC_PARAM_DIGEST, "SHA256",
+                                              smb2->signing_key, iov, niov, mac);
+                }
+                if (rc) {
+                        smb2_set_error(smb2, "Failed to calculate the signature");
+                        return -1;
+                }
+                memcpy(&signature[0], mac, SMB2_SIGNATURE_SIZE);
+                return 0;
+        }
+#else
         if (smb2->dialect > SMB2_VERSION_0210) {
                 size_t i = 0;
                 size_t len = 0, offset = 0;
@@ -184,6 +445,13 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
                 for (i=0; i < niov; i++) {
                         len += iov[i].len;
                 }
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+                if (smb2_aesni_available()) {
+                        smb2_aesni_cmac_iov(smb2->signing_key, iov, niov, len, aes_mac);
+                        memcpy(&signature[0], aes_mac, SMB2_SIGNATURE_SIZE);
+                        return 0;
+                }
+#endif
                 msg = (uint8_t *) malloc(len);
                 if (msg == NULL) {
                         smb2_set_error(smb2, "Failed to allocate buffer for "
@@ -212,6 +480,7 @@ smb2_calc_signature(struct smb2_context *smb2, uint8_t *signature,
         }
 
         return 0;
+#endif
 }
 
 int

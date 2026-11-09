@@ -32,7 +32,7 @@ This API is described in libsmb2-raw.h
 DCE/RPC (libdcerpc)
 ===================
 Full DCE/RPC support (named-pipe transport over SMB2, NDR/YAML/JSON coders,
-srvsvc/lsa/winreg/wkssvc/epm) is provided by a separate library, **libdcerpc**,
+srvsvc/lsa/samr/dssetup/netlogon/winreg/wkssvc/epm) is provided by a separate library, **libdcerpc**,
 which depends on libsmb2 for transport. libdcerpc lives in the libdcerpc/
 directory of this repository but is a separate project with its own build,
 version, soname, packaging and libdcerpc-<version> release tags.
@@ -71,6 +71,9 @@ Arguments supported by libsmb2 are :
 		 krb5: Use Kerberos using credentials from kinit.
 		 krb5cc: Use Kerberos using credentials from credentials
 	                 cache.
+		 iakerb: Use Kerberos through the server (IAKerb), for
+		         clients that can not reach the KDC. The domain
+		         is the Kerberos realm and the password is required.
 		 ntlmssp : Only use NTLMSSP
  vers=<version> : Which SMB version to negotiate:
                   2: Negotiate any version of SMB2
@@ -79,6 +82,16 @@ Arguments supported by libsmb2 are :
 		  Default is to negotiate any SMB2 or SMB3 version.
   seal          : Enable SMB3 encryption.
   sign          : Require SMB2/3 signing.
+  quic          : Use SMB over QUIC instead of TCP. Default port is 443.
+                  Linux only, needs the quic kernel module and libquic.
+                  The server certificate is not verified.
+  rdma          : Use SMB Direct (SMB2 over RDMA) instead of TCP.
+                  Default port is 445 (InfiniBand/RoCE), use :5445 for
+                  iWARP. Linux only, needs librdmacm and an RDMA device.
+                  Needs SMB 3.0 or later, so it can not be combined
+                  with vers=2, vers=2.02 or vers=2.10.
+                  RDMA read/write channels are not used, I/O is limited
+                  to just under 1MB per read/write.
   timeout       : Timeout in seconds when to cancel a command.
                   Default it 0: No timeout.
   ndr32         : DCERPC: only offer NDR32 transfer syntax. (default)
@@ -112,9 +125,9 @@ will be available.
 
 DCE/RPC interfaces
 ==================
-On Linux, libdcerpc (srvsvc, lsarpc, winreg, wkssvc, epm) is built from
-the libdcerpc/ subdirectory together with libsmb2 by default. Disable with
-./configure --disable-libdcerpc or cmake -DENABLE_LIBDCERPC=OFF.
+On Linux, libdcerpc (srvsvc, lsarpc, samr, dssetup, netlogon, winreg, wkssvc,
+epm) is built from the libdcerpc/ subdirectory together with libsmb2 by default.
+Disable with ./configure --disable-libdcerpc or cmake -DENABLE_LIBDCERPC=OFF.
 
 Other platforms only have share enumeration in libsmb2.
 
@@ -140,6 +153,9 @@ You need to set up the environment variable NTLM_USER_FILE to point to this
 file.
 You need one entry in this file for each local user account you want to be able
 to use libsmb2 for accessing a remote share.
+A line is only used for the user it names; user names are compared without
+regard to case. DOMAIN is either the domain or the name of the server, and a
+line with an empty DOMAIN is used when no other line for that user matches.
 
 By default, NTLM authentication will use the username for the current process.
 This can be overridden by specifying a different username in the SMB URL :

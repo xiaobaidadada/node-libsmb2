@@ -545,11 +545,7 @@ smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
         static char smb1sign[4] = {0xFF, 'S', 'M', 'B'};
         static char smb2sign[4] = {0xFE, 'S', 'M', 'B'};
 
-        if (iov->len < SMB2_HEADER_SIZE) {
-                smb2_set_error(smb2, "io vector for header is too small");
-                return -1;
-        }
-        if (!memcmp(iov->buf, smb1sign, 4)) {
+        if (iov->len >= 5 && !memcmp(iov->buf, smb1sign, 4)) {
                 /* an SMBv1 request. if it is a negotiate request
                  * allow it through, else ingore */
                 if (iov->buf[4] == SMB1_NEGOTIATE) {
@@ -559,6 +555,10 @@ smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                         return 0;
                 }
                 smb2_set_error(smb2, "not handling SMBv1 request");
+                return -1;
+        }
+        if (iov->len < SMB2_HEADER_SIZE) {
+                smb2_set_error(smb2, "io vector for header is too small");
                 return -1;
         }
         if (memcmp(iov->buf, smb2sign, 4)) {
@@ -753,8 +753,8 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
                         prev_compound_mid = p->header.message_id;
                 }
 
-                if (smb2->sign ||
-                    (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal)) {
+                if (!p->never_sign && (smb2->sign || p->must_sign ||
+                    (p->header.command == SMB2_TREE_CONNECT && smb2->dialect == SMB2_VERSION_0311 && !smb2->seal))) {
                         if (smb2_pdu_add_signature(smb2, p) < 0) {
                                 smb2_set_error(smb2, "Failure to add "
                                                "signature. %s",
@@ -763,7 +763,11 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
                 }
         }
 
-        smb3_encrypt_pdu(smb2, pdu);
+        if (smb3_encrypt_pdu(smb2, pdu) < 0) {
+                smb2_free_pdu(smb2, pdu);
+                smb2_close_context(smb2);
+                return;
+        }
 
         /*
          * The preauth hash has to cover the bytes we actually put on the
@@ -830,6 +834,39 @@ smb2_get_last_reply_message_id(struct smb2_context *smb2)
         return 0;
 }
 
+uint32_t
+smb2_get_last_request_tree_id(struct smb2_context *smb2)
+{
+        if (smb2 && !(smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
+                return smb2->hdr.sync.tree_id;
+        }
+        return 0;
+}
+
+uint64_t
+smb2_get_last_request_async_id(struct smb2_context *smb2)
+{
+        if (smb2 && (smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
+                return smb2->hdr.async.async_id;
+        }
+        return 0;
+}
+
+uint64_t
+smb2_get_async_id(struct smb2_context *smb2, uint64_t message_id)
+{
+        struct smb2_pdu *pdu;
+
+        if (smb2 == NULL) {
+                return 0;
+        }
+        pdu = smb2_find_pdu(smb2, message_id);
+        if (pdu && (pdu->header.flags & SMB2_FLAGS_ASYNC_COMMAND)) {
+                return pdu->header.async.async_id;
+        }
+        return 0;
+}
+
 struct smb2_pdu *
 smb2_find_pdu(struct smb2_context *smb2,
               uint64_t message_id) {
@@ -846,9 +883,7 @@ smb2_find_pdu(struct smb2_context *smb2,
 static int
 smb2_is_error_response(struct smb2_context *smb2,
                        struct smb2_pdu *pdu) {
-        if (pdu->header.command == SMB2_IOCTL &&
-            smb2_ioctl_status_uses_reply_format(pdu->ctl_code,
-                                                smb2->hdr.status)) {
+        if (pdu->header.command == SMB2_IOCTL && pdu->ioctl_reply_format) {
                 return 0;
         }
         if ((smb2->hdr.status & SMB2_STATUS_SEVERITY_MASK) ==

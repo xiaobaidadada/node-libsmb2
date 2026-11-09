@@ -55,6 +55,8 @@ extern "C" {
 
 #define SMB2_SIGNATURE_SIZE 16
 #define SMB2_KEY_SIZE 16
+/* AES-256 encryption keys */
+#define SMB2_ENC_KEY_SIZE_MAX 32
 
 #define SMB2_MAX_VECTORS 256
 
@@ -171,6 +173,20 @@ struct smb2_context {
 
         int timeout;
 
+#ifdef HAVE_LIBQUIC
+        /* "quic" URL argument: SMB2 over QUIC (MS-SMB2 2.1) using the
+         * kernel QUIC module, see quic.c */
+        int quic;
+        int quic_stream_open;
+        struct smb2_quic_handshake *quic_hs;
+#endif
+#ifdef HAVE_LIBRDMACM
+        /* "rdma" URL argument: SMB2 over SMB Direct [MS-SMBD], see
+         * smbdirect.c. smb2->fd is an epoll fd for the RDMA channels. */
+        int rdma;
+        struct smb2_rdma *rdma_conn;
+#endif
+
         enum smb2_sec sec;
 
         uint16_t security_mode;
@@ -190,6 +206,8 @@ struct smb2_context {
         const char *server;
         const char *share;
         const char *user;
+        /* Server: local account of the Kerberos client, from gss_localname */
+        char *local_user;
 
         /* Only used with --without-libkrb5 */
         const char *password;
@@ -221,12 +239,21 @@ struct smb2_context {
         uint8_t seal:1;
         int8_t seal_requested;
         uint8_t sign:1;
+        /* SMB3 encryption keys derived; sealed clients refuse plaintext from here on */
+        uint8_t enc_keys_ready:1;
+        /* server: the client's NEGOTIATE had an encryption context */
+        uint8_t enc_cap_offered:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
-        uint8_t serverin_key[SMB2_KEY_SIZE];
-        uint8_t serverout_key[SMB2_KEY_SIZE];
+        uint8_t application_key[SMB2_KEY_SIZE];
+        uint8_t serverin_key[SMB2_ENC_KEY_SIZE_MAX];
+        uint8_t serverout_key[SMB2_ENC_KEY_SIZE_MAX];
         uint8_t salt[SMB2_SALT_SIZE];
         uint16_t cypher;
         uint8_t preauthhash[SMB2_PREAUTH_HASH_SIZE];
+        /* on the list smb2_active_contexts() returns: a server's context */
+        int on_active_list;
+        /* server: the hash after the negotiate, where every session's starts */
+        uint8_t negotiate_preauthhash[SMB2_PREAUTH_HASH_SIZE];
 
 
 #ifdef HAVE_LIBKRB5
@@ -324,6 +351,22 @@ typedef void (*smb2_free_payload)(struct smb2_context *smb2, void *payload);
 
 #define SMB2_MAX_PDU_SIZE 16*1024*1024
 
+/* headroom over the negotiated read/write size for headers and the transform header */
+#define SMB2_RECV_PDU_SLACK (64 * 1024)
+
+/* cap peer-supplied PDU lengths to the negotiated read/write size, never above SMB2_MAX_PDU_SIZE */
+static inline uint32_t
+smb2_recv_pdu_cap(const struct smb2_context *smb2)
+{
+        uint32_t max = smb2->max_read_size > smb2->max_write_size ?
+                smb2->max_read_size : smb2->max_write_size;
+
+        if (max == 0 || max > SMB2_MAX_PDU_SIZE - SMB2_RECV_PDU_SLACK) {
+                return SMB2_MAX_PDU_SIZE;
+        }
+        return max + SMB2_RECV_PDU_SLACK;
+}
+
 struct smb2_pdu {
         struct smb2_pdu *next;
         struct smb2_header header;
@@ -341,6 +384,10 @@ struct smb2_pdu {
          * signed, and before the pdu can be written out and freed.
          */
         int update_preauth_hash;
+        /* sign even when the session is not signed (MS-SMB2 3.3.5.15.12) */
+        int must_sign;
+        /* never sign: a reply for a session the server has retired */
+        int never_sign;
         smb2_command_cb cb;
         void *cb_data;
         void (*free_cb)(void *);
@@ -376,6 +423,8 @@ struct smb2_pdu {
          * instead of the generic SMB2 error format.
          */
         uint32_t ctl_code;
+        /* this error reply uses the IOCTL reply format */
+        int ioctl_reply_format;
 
         /* For encrypted PDUs */
         uint8_t seal:1;
@@ -395,6 +444,14 @@ struct smb2dir {
         void *cb_data;
         smb2_file_id file_id;
 
+        /*
+         * For smb2_opendir_async_pdu(): the pdu the caller owns, until the
+         * first callback runs. Freeing the pdu before that cancels the
+         * opendir, which then frees dir and calls cancel_free_cb(cb_data).
+         */
+        struct smb2_pdu *cancel_pdu;
+        void (*cancel_free_cb)(void *);
+
         struct smb2_dirent_internal *entries;
         struct smb2_dirent_internal *current_entry;
         int index;
@@ -407,6 +464,42 @@ void smb2_set_nterror(struct smb2_context *smb2, int nterror,
                     const char *error_string, ...);
 
 void smb2_close_connecting_fds(struct smb2_context *smb2);
+
+#ifdef HAVE_LIBQUIC
+#ifndef IPPROTO_QUIC
+#define IPPROTO_QUIC 261
+#endif
+struct iovec;
+int smb2_quic_handshake_start(struct smb2_context *smb2);
+int smb2_quic_server_handshake_start(struct smb2_context *smb2,
+                                     const char *cert_file,
+                                     const char *key_file);
+int smb2_quic_listen(uint16_t port, int max_connections, int *out_fd);
+int smb2_quic_handshake_service(struct smb2_context *smb2);
+int smb2_quic_events(struct smb2_context *smb2);
+ssize_t smb2_quic_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+void smb2_quic_reset(struct smb2_context *smb2);
+#else
+#define smb2_quic_reset(smb2) do { } while (0)
+#endif
+
+#ifdef HAVE_LIBRDMACM
+struct iovec;
+struct addrinfo;
+int smb2_rdma_connect(struct smb2_context *smb2, const struct addrinfo *ai);
+int smb2_rdma_connected(struct smb2_context *smb2);
+int smb2_rdma_service(struct smb2_context *smb2);
+int smb2_rdma_flush_output(struct smb2_context *smb2);
+ssize_t smb2_rdma_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+ssize_t smb2_rdma_readv(struct smb2_context *smb2,
+                        const struct iovec *iov, int iovcnt);
+void smb2_rdma_cap_io_sizes(struct smb2_context *smb2);
+void smb2_rdma_reset(struct smb2_context *smb2);
+#else
+#define smb2_rdma_reset(smb2) do { } while (0)
+#endif
 
 void *smb2_alloc_init(struct smb2_context *smb2, size_t size);
 void *smb2_alloc_data(struct smb2_context *smb2, void *memctx, size_t size);
@@ -431,6 +524,7 @@ int smb2_process_payload_variable(struct smb2_context *smb2,
 int smb2_get_fixed_size(struct smb2_context *smb2, struct smb2_pdu *pdu);
 
 struct smb2_pdu *smb2_find_pdu(struct smb2_context *smb2, uint64_t message_id);
+void smb2_add_active_context(struct smb2_context *smb2);
 void smb2_free_iovector(struct smb2_context *smb2, struct smb2_io_vectors *v);
 
 /*
@@ -576,7 +670,7 @@ int smb2_process_ioctl_request_fixed(struct smb2_context *smb2,
                              struct smb2_pdu *pdu);
 int smb2_process_ioctl_request_variable(struct smb2_context *smb2,
                                 struct smb2_pdu *pdu);
-int smb2_ioctl_status_uses_reply_format(uint32_t ctl_code, uint32_t status);
+int smb2_ioctl_errors_may_use_reply_format(uint32_t ctl_code);
 
 int smb2_decode_file_basic_info(struct smb2_context *smb2,
                                 void *memctx,

@@ -66,6 +66,14 @@ typedef void (*smb2_client_connection)(struct smb2_context *smb2, void *cb_data)
  */
 struct smb2_oplock_or_lease_break_reply;
 
+/*
+ * An smb2_oplock_or_lease_break_cb callback can store this in
+ * *new_lease_state to stop libsmb2 acknowledging a lease break itself.
+ * The app must then send the acknowledgement explicitly with
+ * smb2_cmd_lease_break_async().
+ */
+#define SMB2_LEASE_STATE_NO_AUTO_ACK 0xFFFFFFFFu
+
 typedef void (*smb2_oplock_or_lease_break_cb)(struct smb2_context *smb2,
            int status,
            struct smb2_oplock_or_lease_break_reply *rep,
@@ -194,13 +202,15 @@ void smb2_close_context(struct smb2_context *smb2);
 void smb2_destroy_context(struct smb2_context *smb2);
 
 /*
- * Get the list of currently allocated contexts
+ * Get the list of the contexts smb2_serve_port() has accepted and not yet
+ * destroyed. Client contexts are not on it.
  */
 struct smb2_context *smb2_active_contexts(void);
 
 /*
- * Determine of the context is currently active.  This lets
- * code know if the context was destroyed in a callback for example
+ * Is this context on the smb2_active_contexts() list, i.e. a context
+ * smb2_serve_port() accepted that has not been destroyed yet? Always 0 for
+ * a client context.
  */
 int smb2_context_active(struct smb2_context *smb2);
 
@@ -426,6 +436,7 @@ enum smb2_sec {
         SMB2_SEC_UNDEFINED = 0,
         SMB2_SEC_NTLMSSP,
         SMB2_SEC_KRB5,
+        SMB2_SEC_IAKERB,
 };
 
 /*
@@ -433,6 +444,13 @@ enum smb2_sec {
  * SMB2_SEC_UNDEFINED (use KRB if available or NTLM if not)
  * SMB2_SEC_NTLMSSP
  * SMB2_SEC_KRB5
+ * SMB2_SEC_IAKERB
+ *     IAKerb (Initial and Pass-Through Authentication Using Kerberos).
+ *     The client builds the Kerberos exchange locally and the SMB server
+ *     proxies it to a KDC the client cannot reach. The domain is the
+ *     Kerberos realm. The password is required, as for sec=krb5cc.
+ *     URL query: sec=iakerb
+ *     smb2_set_authentication(SMB2_SEC_IAKERB) selects the same path.
  */
 void smb2_set_authentication(struct smb2_context *smb2, int val);
 
@@ -447,6 +465,13 @@ void smb2_set_user(struct smb2_context *smb2, const char *user);
  * returns NULL if none
  */
 const char *smb2_get_user(struct smb2_context *smb2);
+
+/*
+ * Server: the local account a Kerberos client's principal maps to, as
+ * krb5's auth_to_local rules and localauth plugins (sssd, winbind) say.
+ * returns NULL for NTLMSSP sessions or when the principal has no mapping.
+ */
+const char *smb2_get_local_user(struct smb2_context *smb2);
 
 /*
  * Set the password that we will try to authenticate as.
@@ -545,6 +570,16 @@ const char *smb2_get_client_guid(struct smb2_context *smb2);
  * Returns the server_guid for this context.
  */
 const char *smb2_get_server_guid(struct smb2_context *smb2);
+
+/*
+ * Copies the application key of the session to key: Session.ApplicationKey
+ * of [MS-SMB2] 3.2.5.3.1, which DCE/RPC over a named pipe uses as its
+ * session key, e.g. to encrypt the password buffers of SAMR.
+ *
+ * Returns 0 on success, or -EINVAL if there is no logged-on session with
+ * a session key.
+ */
+int smb2_get_application_key(struct smb2_context *smb2, uint8_t key[16]);
         
 /*
  * Asynchronous call to connect a TCP connection to the server
@@ -738,6 +773,19 @@ void smb2_set_pdu_message_id(struct smb2_context *smb2, struct smb2_pdu *pdu, ui
 uint64_t smb2_get_pdu_message_id(struct smb2_context *smb2, struct smb2_pdu *pdu);
 uint64_t smb2_get_last_request_message_id(struct smb2_context *smb2);
 uint64_t smb2_get_last_reply_message_id(struct smb2_context *smb2);
+/*
+ * The tree id of the request being handled, 0 if it is an async request
+ * (which names no tree), and its async id, 0 if it is not async. A
+ * CANCEL of a request that got STATUS_PENDING names it by async id.
+ */
+uint32_t smb2_get_last_request_tree_id(struct smb2_context *smb2);
+uint64_t smb2_get_last_request_async_id(struct smb2_context *smb2);
+/*
+ * The async id of the outstanding request with this message id: the one
+ * a server gave it with its STATUS_PENDING reply, or a client got for it
+ * in one. 0 if there is no such request or it is not async.
+ */
+uint64_t smb2_get_async_id(struct smb2_context *smb2, uint64_t message_id);
 int smb2_pdu_is_compound(struct smb2_context *smb2);
 
 /*
@@ -753,7 +801,7 @@ struct smb2dir;
  *          through the callback function.
  *          The pdu must be freed by smb2_free_pdu().
  *          The pdu can be cancelled before the callback is invoked by freeing
- *          it.
+ *          it. free_cb, if not NULL, is then called with cb_data.
  * NULL :   There was an error. The callback function will not be invoked.
  *
  * When the callback is invoked, status indicates the result:
@@ -831,7 +879,7 @@ struct smb2fh;
  *          through the callback function.
  *          The pdu must be freed by smb2_free_pdu().
  *          The pdu can be cancelled before the callback is invoked by freeing
- *          it.
+ *          it. free_cb, if not NULL, is then called with cb_data.
  * NULL :   There was an error. The callback function will not be invoked.
  *
  * Opens or creates a file.
@@ -1503,6 +1551,11 @@ free_smb2_file_notify_change_information(struct smb2_context *smb2, struct smb2_
 int smb2_notify_change_async(struct smb2_context *smb2, const char *path, uint16_t flags, uint32_t filter, int loop,
                        smb2_command_cb cb, void *cb_data);
 
+/*
+ * As smb2_notify_change_async() but on a directory handle the caller has
+ * opened. The handle stays the caller's: it is not closed when the watch
+ * ends, and the caller must not close it while a watch is outstanding.
+ */
 int smb2_notify_change_filehandle_async(struct smb2_context *smb2, struct smb2fh *smb2_dir_fh, uint16_t flags, uint32_t filter, int loop,
                        smb2_command_cb cb, void *cb_data);
 
@@ -1535,9 +1588,27 @@ const char *smb2_utf16_to_utf8(const uint16_t *str, size_t len);
 struct smb2_server;
 
 /* pdu handlers in general take the request from the client, and return
- * < 0  on error, and the library should create an error reply
+ * < 0  on error, and the library replies with STATUS_NOT_IMPLEMENTED
  * == 0 on OK, and the library should use the reply struct (if needed) to create a reply
  * > 0  if the handler created and queued a reply itself
+ *
+ * A handler that queues its own reply has to give it the request's
+ * message id, smb2_set_pdu_message_id(smb2, pdu,
+ * smb2_get_last_request_message_id(smb2)), or the reply is dropped.
+ * Queueing the reply frees the request: the handler must not touch req,
+ * or anything it points to, after that. A handler that replies later
+ * keeps req valid until then, but has to save that message id now.
+ * Pointers into the received data (a create's create_context, an
+ * ioctl's input outside FSCTL_VALIDATE_NEGOTIATE_INFO) are only valid
+ * during the call.
+ *
+ * Ioctl input and output buffers are only passed through for
+ * FSCTL_PIPE_TRANSCEIVE, or for any ioctl when the context runs in
+ * passthrough mode (smb2_set_passthrough()).
+ *
+ * cancel_cmd is told of a CANCEL (smb2_get_last_request_message_id()
+ * is the id of the request to cancel). A CANCEL has no reply of its
+ * own, and the library frees it once cancel_cmd returns.
  */
 struct smb2_server_request_handlers {
         int (*destruction_event)(struct smb2_server *srvr, struct smb2_context *smb2);
@@ -1646,6 +1717,15 @@ struct smb2_server {
          * instead of having to sleep and hope.
          */
         volatile int listener_ready;
+        /*
+         * SMB2 over QUIC instead of TCP, when built with libquic: listen
+         * on UDP port "port", 443 if 0. quic_cert_file is the PEM
+         * certificate chain the server presents, quic_key_file its PEM
+         * private key.
+         */
+        int quic;
+        char quic_cert_file[256];
+        char quic_key_file[256];
 };
 
 int smb2_bind_and_listen(const uint16_t port, const int max_connections, int *out_fd);

@@ -21,6 +21,15 @@
 /* Define to 1 if you have the <GSS/GSS.h> header file. */
 #cmakedefine HAVE_GSS_GSS_H "@HAVE_GSS_GSS_H@"
 
+/* Whether we have libquic for SMB2 over QUIC */
+#cmakedefine HAVE_LIBQUIC 1
+
+/* Whether we have librdmacm for SMB Direct */
+#cmakedefine HAVE_LIBRDMACM 1
+
+/* Whether we use OpenSSL's libcrypto */
+#cmakedefine HAVE_OPENSSL 1
+
 /* Whether we use gssapi_krb5 or not */
 #cmakedefine HAVE_LIBKRB5 "@HAVE_LIBKRB5@"
 

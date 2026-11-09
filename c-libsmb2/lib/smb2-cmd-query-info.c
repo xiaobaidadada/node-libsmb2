@@ -388,7 +388,7 @@ smb2_process_query_info_fixed(struct smb2_context *smb2,
                 return -1;
         }
 
-        rep = malloc(sizeof(*rep));
+        rep = calloc(1, sizeof(*rep));
         if (rep == NULL) {
                 smb2_set_error(smb2, "Failed to allocate query info reply");
                 return -1;
@@ -776,7 +776,7 @@ smb2_process_query_info_request_fixed(struct smb2_context *smb2,
                 return -1;
         }
 
-        req = malloc(sizeof(*req));
+        req = calloc(1, sizeof(*req));
         if (req == NULL) {
                 smb2_set_error(smb2, "Failed to allocate query info request");
                 return -1;
@@ -800,6 +800,15 @@ smb2_process_query_info_request_fixed(struct smb2_context *smb2,
                         (SMB2_QUERY_INFO_REQUEST_SIZE & 0xfffe)) {
                 smb2_set_error(smb2, "Input buffer overlaps with "
                                "Query Info request header");
+                pdu->payload = NULL;
+                free(req);
+                return -1;
+        }
+
+        if ((uint64_t)req->input_buffer_offset + req->input_buffer_length >
+            smb2->spl) {
+                smb2_set_error(smb2, "Query info input buffer extends beyond "
+                               "end of PDU");
                 pdu->payload = NULL;
                 free(req);
                 return -1;

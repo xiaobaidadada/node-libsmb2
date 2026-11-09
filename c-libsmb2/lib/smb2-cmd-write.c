@@ -152,7 +152,7 @@ smb2_cmd_write_async(struct smb2_context *smb2,
         }
 
         /* Adjust credit charge for large payloads */
-        if (smb2->supports_multi_credit) {
+        if (smb2->supports_multi_credit && req->length > 0) {
                 pdu->header.credit_charge = (req->length - 1) / 65536 + 1; /* 3.1.5.2 of [MS-SMB2] */
         }
 
@@ -230,7 +230,7 @@ smb2_process_write_fixed(struct smb2_context *smb2,
                 return -1;
         }
 
-        rep = malloc(sizeof(*rep));
+        rep = calloc(1, sizeof(*rep));
         if (rep == NULL) {
                 smb2_set_error(smb2, "Failed to allocate write reply");
                 return -1;
@@ -263,7 +263,7 @@ smb2_process_write_request_fixed(struct smb2_context *smb2,
                 return -1;
         }
 
-        req = malloc(sizeof(*req));
+        req = calloc(1, sizeof(*req));
         if (req == NULL) {
                 smb2_set_error(smb2, "Failed to allocate write request");
                 return -1;
@@ -288,6 +288,15 @@ smb2_process_write_request_fixed(struct smb2_context *smb2,
                         free(req);
                         return -1;
                 }
+        }
+
+        if ((uint64_t)IOVREQ_OFFSET_WRITE +
+            PAD_TO_64BIT(req->write_channel_info_length) + req->length >
+            smb2->spl) {
+                smb2_set_error(smb2, "Write data extends beyond end of PDU");
+                pdu->payload = NULL;
+                free(req);
+                return -1;
         }
 
         if (req->length) {

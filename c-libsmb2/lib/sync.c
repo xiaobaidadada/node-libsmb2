@@ -62,6 +62,46 @@
 #include "libsmb2-raw.h"
 #include "libsmb2-private.h"
 
+static int pdu_on_list(struct smb2_pdu *list, struct smb2_pdu *pdu)
+{
+        for (; list; list = list->next) {
+                if (list == pdu) {
+                        return 1;
+                }
+        }
+        return 0;
+}
+
+/*
+ * Free a PDU that a sync call owns (caller_frees_pdu) after waiting for it
+ * failed, e.g. because the connection dropped. If it has not completed, its
+ * callback still owns state such as the smb2dir or smb2fh, so complete it
+ * with SMB2_STATUS_SHUTDOWN first, as smb2_destroy_context() does for the
+ * PDUs it finds. The sync callback's cb_data must still be valid.
+ */
+static void sync_free_pending_pdu(struct smb2_context *smb2,
+                                  struct smb2_pdu *pdu)
+{
+        int pending = 0;
+
+        if (smb2->pdu == pdu) {
+                smb2->pdu = NULL;
+                pending = 1;
+        }
+        if (smb2->next_pdu == pdu) {
+                smb2->next_pdu = NULL;
+                pending = 1;
+        }
+        if (pdu_on_list(smb2->outqueue, pdu) ||
+            pdu_on_list(smb2->waitqueue, pdu)) {
+                pending = 1;
+        }
+        if (pending && pdu->cb) {
+                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
+        }
+        smb2_free_pdu(smb2, pdu);
+}
+
 static int wait_for_reply(struct smb2_context *smb2,
                           struct sync_cb_data *cb_data)
 {
@@ -89,6 +129,14 @@ static int wait_for_reply(struct smb2_context *smb2,
                         continue;
                 }
 		if (smb2_service(smb2, pfd.revents) < 0) {
+                        /*
+                         * Our reply was processed before the error: the
+                         * call completed, so return its result. The
+                         * connection error shows up on the next call.
+                         */
+                        if (cb_data->is_finished) {
+                                break;
+                        }
 			smb2_set_error(smb2, "smb2_service failed with : "
                                         "%s\n", smb2_get_error(smb2));
                         return -1;
@@ -208,8 +256,8 @@ struct smb2dir *smb2_opendir(struct smb2_context *smb2, const char *path)
 	}
 
 	if (wait_for_reply(smb2, cb_data) < 0) {
+                sync_free_pending_pdu(smb2, pdu);
                 free(cb_data);
-                smb2_free_pdu(smb2, pdu);
                 return NULL;
         }
 
@@ -256,7 +304,7 @@ struct smb2fh *smb2_open(struct smb2_context *smb2, const char *path, int flags)
 	}
 
 	if (wait_for_reply(smb2, cb_data) < 0) {
-                smb2_free_pdu(smb2, pdu);
+                sync_free_pending_pdu(smb2, pdu);
                 free(cb_data);
                 return NULL;
         }
@@ -276,6 +324,14 @@ static void sync_close_cb(struct smb2_context *smb2, int status,
         struct sync_cb_data *cb_data = private_data;
 
         if (status == SMB2_STATUS_SHUTDOWN) {
+                if (cb_data->status == SMB2_STATUS_CANCELLED) {
+                        free(cb_data);
+                } else {
+                        /* The waiter still owns this state. Wake it so it
+                         * can release the state even if service fails. */
+                        cb_data->status = SMB2_STATUS_SHUTDOWN;
+                        cb_data->is_finished = 1;
+                }
                 return;
         }
         if (cb_data->status == SMB2_STATUS_CANCELLED) {
@@ -305,11 +361,16 @@ int smb2_close(struct smb2_context *smb2, struct smb2fh *fh)
 
 	rc = wait_for_reply(smb2, cb_data);
         if (rc < 0) {
+                if (cb_data->is_finished) {
+                        goto out;
+                }
+                /* the CLOSE is still queued: sync_close_cb() owns and
+                 * frees cb_data when its reply (or SHUTDOWN) arrives */
                 cb_data->status = SMB2_STATUS_CANCELLED;
-                goto out;
+                return rc;
 	}
 
-        rc = cb_data->status;
+        rc = cb_data->status == SMB2_STATUS_SHUTDOWN ? -EIO : cb_data->status;
  out:
         free(cb_data);
 
@@ -1100,6 +1161,11 @@ static void sync_notify_change_cb(struct smb2_context *smb2, int status,
         struct sync_cb_data *cb_data = private_data;
 
         if (cb_data->status == SMB2_STATUS_CANCELLED) {
+                if (command_data) {
+                        free_smb2_file_notify_change_information(smb2,
+                                                                 command_data);
+                }
+                free(cb_data);
                 return;
         }
 
@@ -1131,7 +1197,6 @@ struct smb2_file_notify_change_information *smb2_notify_change(struct smb2_conte
 
 	if (wait_for_reply(smb2, cb_data) < 0) {
                 cb_data->status = SMB2_STATUS_CANCELLED;
-                free(cb_data);
                 return NULL;
         }
 
@@ -1146,6 +1211,9 @@ static void sync_share_enum_cb(struct smb2_context *smb2, int status,
         struct sync_cb_data *cb_data = private_data;
 
         if (cb_data->status == SMB2_STATUS_CANCELLED) {
+                if (command_data) {
+                        smb2_free_data(smb2, command_data);
+                }
                 free(cb_data);
                 return;
         }
@@ -1184,6 +1252,7 @@ smb2_share_enum_sync(struct smb2_context *smb2,
 
 	rc = wait_for_reply(smb2, cb_data);
         if (rc < 0) {
+                cb_data->status = SMB2_STATUS_CANCELLED;
                 return NULL;
 	}
 

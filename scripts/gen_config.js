@@ -22,7 +22,9 @@ const STD_HEADERS = [
     "string.h",
 ];
 
-/** 只在类 Unix 系统上存在的头文件，Windows 一律不开 */
+/**
+ * 只在类 Unix 系统上存在的头文件，Windows 一律不开
+ */
 const POSIX_HEADERS = [
     "arpa/inet.h",
     "dlfcn.h",
@@ -49,6 +51,15 @@ const POSIX_HEADERS = [
     "unistd.h",
 ];
 
+/**
+ * MSVC / MinGW 同样提供的头文件。
+ * fcntl.h 在 Windows 上给出 O_RDONLY / O_CREAT / O_EXCL / O_TRUNC 等 open() 需要的标志，
+ * libsmb2 的 lib/libsmb2.c 会直接用到，所以 Windows 下也必须开。
+ */
+const WIN_HEADERS = [
+    "fcntl.h",
+];
+
 /** 头文件名整体大写、非字母数字转下划线：sys/time.h -> HAVE_SYS_TIME_H */
 function define_header(h) {
     const macro = "HAVE_" + h.toUpperCase().replace(/[^A-Z0-9]/g, "_");
@@ -59,9 +70,11 @@ function generate() {
     const is_win = process.platform === "win32";
     const is_mac = process.platform === "darwin";
 
-    // Windows 走 compat.h 的 Winsock 兼容层，POSIX 头一个都不能开；
-    // C 标准库头各平台都有，照常打开
-    const headers = is_win ? STD_HEADERS : [...STD_HEADERS, ...POSIX_HEADERS];
+    // Windows 走 compat.h 的 Winsock 兼容层，POSIX 头都不能开，但 fcntl.h 等
+    // MSVC 自带的头必须开；C 标准库头各平台都有，照常打开
+    const headers = is_win
+        ? [...STD_HEADERS, ...WIN_HEADERS]
+        : [...STD_HEADERS, ...POSIX_HEADERS];
 
     const lines = [
         "/* 由 scripts/gen_config.js 按当前平台生成，不要手工修改 */",

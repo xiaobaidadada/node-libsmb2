@@ -172,7 +172,7 @@ smb2_cmd_read_async(struct smb2_context *smb2,
         }
 
         /* Adjust credit charge for large payloads */
-        if (smb2->supports_multi_credit) {
+        if (smb2->supports_multi_credit && req->length > 0) {
                 pdu->header.credit_charge = (req->length - 1) / 65536 + 1; /* 3.1.5.2 of [MS-SMB2] */
         }
 
@@ -260,7 +260,7 @@ smb2_process_read_fixed(struct smb2_context *smb2,
                 return -1;
         }
 
-        rep = malloc(sizeof(*rep));
+        rep = calloc(1, sizeof(*rep));
         if (rep == NULL) {
                 smb2_set_error(smb2, "Failed to allocate read reply");
                 return -1;
@@ -287,6 +287,28 @@ smb2_process_read_fixed(struct smb2_context *smb2,
                 pdu->payload = NULL;
                 free(rep);
                 return -1;
+        }
+
+        /* The data goes into the buffer the read was issued with, and
+         * anything past it into a scratch tail, but data_length is what
+         * callers are told was read: more than was asked for would have
+         * them use bytes their buffer does not hold.
+         */
+        if (pdu->in.niov) {
+                size_t asked = 0;
+                int i;
+
+                for (i = 0; i < pdu->in.niov; i++) {
+                        asked += pdu->in.iov[i].len;
+                }
+                if (rep->data_length > asked) {
+                        smb2_set_error(smb2, "Read returned %u bytes, "
+                                       "%zu were asked for",
+                                       rep->data_length, asked);
+                        pdu->payload = NULL;
+                        free(rep);
+                        return -1;
+                }
         }
 
         if (rep->data_offset != SMB2_HEADER_SIZE + 16) {

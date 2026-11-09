@@ -23,6 +23,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "smb2.h"
 #include "libsmb2.h"
@@ -371,8 +372,25 @@ int ioctl_handler(struct smb2_server *srvr, struct smb2_context *smb2,
         switch(rep->ctl_code) {
         case SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO:
                 break;
-        default:
+        case SMB2_FSCTL_DFS_GET_REFERRALS:
+        case SMB2_FSCTL_DFS_GET_REFERRALS_EX: {
+                /* MS-SMB2 3.3.5.15.2: no DFS here */
+                struct smb2_error_reply err;
+                struct smb2_pdu *pdu;
+
+                memset(&err, 0, sizeof(err));
+                pdu = smb2_cmd_error_reply_async(smb2, &err, SMB2_IOCTL,
+                                SMB2_STATUS_FS_DRIVER_REQUIRED, NULL, NULL);
+                if (pdu == NULL) {
+                        return -1;
+                }
+                smb2_set_pdu_message_id(smb2, pdu,
+                                smb2_get_last_request_message_id(smb2));
+                smb2_queue_pdu(smb2, pdu);
                 return 1;
+        }
+        default:
+                return -1;
         }
         return 0;
 }
@@ -438,11 +456,17 @@ struct smb2_server_request_handlers test_handlers = {
 };
 
 struct smb2_server server;
+static int ntlmssp_only;
 
 int usage(void)
 {
     fprintf(stderr, "Usage:\n"
-            "smbsever [port]\n\n");
+            "smb2-server-sync [-N] [-C cert.pem -K key.pem] <port> [hostname]\n\n"
+            "hostname is the Kerberos service host (cifs/<hostname>),\n"
+            "defaults to gethostname().\n"
+            "-C/-K serve SMB2 over QUIC with this PEM certificate and key\n"
+            "instead of TCP, port 0 means 443.\n"
+            "-N only NTLMSSP, no Kerberos.\n\n");
     exit(1);
 }
 
@@ -464,29 +488,56 @@ void on_new_client(struct smb2_context *smb2, void *cb_data)
 //  smb2_set_version(smb2, SMB2_VERSION_0210);
 
     smb2_register_error_callback(smb2, on_smb2_error);
+    if (ntlmssp_only) {
+        smb2_set_authentication(smb2, SMB2_SEC_NTLMSSP);
+    }
     *pctx = smb2;
 }
 
 int main(int argc, char **argv)
 {
     struct smb2_context *smb2 = NULL;
-    int err;
-
-    if (argc < 2) {
-        usage();
-    }
+    const char *cert = NULL, *key = NULL;
+    int err, c;
 
     memset(&server, 0, sizeof(server));
+    while ((c = getopt(argc, argv, "C:K:N")) != -1) {
+        switch (c) {
+        case 'N':
+            ntlmssp_only = 1;
+            break;
+        case 'C':
+            cert = optarg;
+            break;
+        case 'K':
+            key = optarg;
+            break;
+        default:
+            usage();
+        }
+    }
+    if (optind >= argc || !cert != !key) {
+        usage();
+    }
+    if (cert) {
+        server.quic = 1;
+        snprintf(server.quic_cert_file, sizeof(server.quic_cert_file), "%s", cert);
+        snprintf(server.quic_key_file, sizeof(server.quic_key_file), "%s", key);
+    }
+
     server.handlers = &test_handlers;
 
     server.signing_enabled = 1;
     server.allow_anonymous = 1;
 
-    server.port = strtoul(argv[1], NULL, 0);
+    server.port = strtoul(argv[optind], NULL, 0);
+    if (optind + 1 < argc) {
+        snprintf(server.hostname, sizeof(server.hostname), "%s", argv[optind + 1]);
+    }
 
     err = smb2_serve_port(&server, 1, on_new_client, (void *)&smb2);
     if (err) {
-        fprintf(stderr, "smb2_serv_port failed %d\n", err);
+        fprintf(stderr, "smb2_serve_port failed %d %s\n", err, server.error);
         exit(err);
     }
 

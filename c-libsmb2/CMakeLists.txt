@@ -57,7 +57,16 @@ endif()
       option(BUILD_SHARED_LIBS "Build shared libraries" ON)
     endif()
       option(ENABLE_EXAMPLES "Build example programs" OFF)
-      option(ENABLE_UTILS "Build and install the utilities" OFF)
+      # The utilities need a hosted POSIX system (poll.h, a full libc), so
+      # only build them by default there: not on Windows, the consoles or
+      # the embedded targets.
+      if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin|.*BSD|DragonFly|SunOS|Solaris|Android)$"
+         AND NOT PS4 AND NOT PICO_BOARD)
+        set(ENABLE_UTILS_DEFAULT ON)
+      else()
+        set(ENABLE_UTILS_DEFAULT OFF)
+      endif()
+      option(ENABLE_UTILS "Build and install the utilities" ${ENABLE_UTILS_DEFAULT})
       option(ENABLE_LIBKRB5 "Enable libkrb5 support" ON)
       option(ENABLE_GSSAPI "Enable gssapi support" ON)
       list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
@@ -74,6 +83,16 @@ endif()
       message(STATUS "Build libdcerpc (full DCE/RPC interfaces)")
     else()
       message(STATUS "libdcerpc disabled")
+    endif()
+
+    # Only libdcerpc's coders and server runtime, without libsmb2: for a
+    # project that has libsmb2 as a submodule to get at libdcerpc, such as
+    # ksmbd-tools through meson's cmake module.
+    option(LIBDCERPC_ONLY "Build only libdcerpc, without the libsmb2 transport" OFF)
+    if(LIBDCERPC_ONLY)
+      set(WITH_LIBSMB2 OFF CACHE BOOL "" FORCE)
+      add_subdirectory(libdcerpc)
+      return()
     endif()
   endif()
 
@@ -132,6 +151,56 @@ endif()
         endif()
       endif()
     endif()
+  endif()
+
+  # SMB2 over QUIC (the "quic" URL argument) uses the Linux kernel QUIC module for
+  # the transport and libquic (on top of gnutls) for the TLS 1.3
+  # handshake, so it is Linux only. Built in when libquic is found.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT (ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX))
+    option(ENABLE_LIBQUIC "Enable SMB2 over QUIC (needs libquic)" ON)
+    if(ENABLE_LIBQUIC)
+      find_path(LIBQUIC_INCLUDE_DIR netinet/quic.h)
+      find_library(LIBQUIC_LIBRARY quic)
+      find_library(GNUTLS_LIBRARY gnutls)
+      if(LIBQUIC_INCLUDE_DIR AND LIBQUIC_LIBRARY AND GNUTLS_LIBRARY)
+        message(STATUS "Build with SMB2 over QUIC support")
+        set(HAVE_LIBQUIC 1)
+        list(APPEND core_DEPENDS ${LIBQUIC_LIBRARY} ${GNUTLS_LIBRARY})
+      else()
+        message(STATUS "libquic not found, building without SMB2 over QUIC")
+      endif()
+    endif()
+  endif()
+
+  # SMB2 over SMB Direct (the "rdma" URL argument) uses librdmacm and
+  # libibverbs from rdma-core, Linux only. Built in when they are found.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT (ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX))
+    option(ENABLE_RDMA "Enable SMB Direct (needs librdmacm and libibverbs)" ON)
+    if(ENABLE_RDMA)
+      find_path(RDMACM_INCLUDE_DIR rdma/rdma_cma.h)
+      find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h)
+      find_library(RDMACM_LIBRARY rdmacm)
+      find_library(IBVERBS_LIBRARY ibverbs)
+      if(RDMACM_INCLUDE_DIR AND IBVERBS_INCLUDE_DIR AND RDMACM_LIBRARY AND IBVERBS_LIBRARY)
+        message(STATUS "Build with SMB Direct support")
+        set(HAVE_LIBRDMACM 1)
+        list(APPEND core_DEPENDS ${RDMACM_LIBRARY} ${IBVERBS_LIBRARY})
+      else()
+        message(STATUS "librdmacm/libibverbs not found, building without SMB Direct")
+      endif()
+    endif()
+  endif()
+
+  option(ENABLE_OPENSSL "Use OpenSSL 3 libcrypto for signing and encryption" OFF)
+  if(ENABLE_OPENSSL)
+    find_package(OpenSSL 3.0 COMPONENTS Crypto)
+    if(NOT OPENSSL_FOUND)
+      message(FATAL_ERROR "OpenSSL 3.0 or later libcrypto not found")
+    endif()
+    message(STATUS "Build with OpenSSL")
+    set(HAVE_OPENSSL 1)
+    include_directories(${OPENSSL_INCLUDE_DIR})
+    list(APPEND core_DEPENDS ${OPENSSL_CRYPTO_LIBRARY})
   endif()
 
   if(NOT ESP_PLATFORM)
@@ -204,12 +273,11 @@ endif()
         if(DEBUG)
           add_definitions(-DDEBUG)
         endif()
-        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -fno-builtin")
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -s")                
       endif()
-      set(CMAKE_C_FLAGS "-Wall") 
+      # as ps2sdk's Makefile.iopglobal: the IOP kernel cannot take the
+      # several LO relocs to one HI that GCC makes without -mno-explicit-relocs
+      set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -fno-builtin -msoft-float -mno-explicit-relocs")
       include_directories(${CMAKE_CURRENT_BINARY_DIR} include/ps2)
-      add_compile_options("${CMAKE_C_FLAGS}")
     elseif(VITA)
       add_definitions(-DNEED_READV -DNEED_WRITEV -DNEED_GETLOGIN_R)  
     elseif(PICO_BOARD)
@@ -225,13 +293,20 @@ endif()
       find_library(SOCKET_LIBRARY socket)
       find_library(NSL_LIBRARY nsl)
       list(APPEND CORE_LIBRARIES ${SOCKET_LIBRARY} ${NSL_LIBRARY})
+    elseif(CMAKE_SYSTEM_NAME STREQUAL Haiku)
+      # Errors are reported as -errno, but Haiku's error codes are negative
+      # already. The error mapper makes errno match the positive constants;
+      # its symbols are hidden, so it does not affect users of the library.
+      add_definitions(-DB_USE_POSITIVE_POSIX_ERRORS)
+      # The socket functions live in libnetwork.so, not in libroot.so
+      list(APPEND CORE_LIBRARIES posix_error_mapper network)
     endif()
 
     # Look for a cryptographically strong source of random bytes for
     # smb2_random_bytes(). Only probed on the host-like systems: anything we
     # do not positively identify here simply falls back to the random()
     # based path, so the console and embedded toolchains are left alone.
-    if(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin|.*BSD|Solaris|Android")
+    if(CMAKE_SYSTEM_NAME MATCHES "Linux|Darwin|.*BSD|Solaris|Android|Haiku")
       include(CheckSymbolExists)
       check_symbol_exists(arc4random_buf "stdlib.h" HAVE_ARC4RANDOM_BUF)
       check_symbol_exists(getrandom "sys/random.h" HAVE_GETRANDOM)
@@ -271,8 +346,13 @@ endif()
       configure_file(cmake/libsmb2.pc.cmake
                   ${CMAKE_CURRENT_BINARY_DIR}/libsmb2.pc @ONLY)
 
-      install(DIRECTORY include/smb2
-            DESTINATION ${INSTALL_INC_DIR})
+      install(FILES include/smb2/libsmb2.h
+                    include/smb2/libsmb2-raw.h
+                    include/smb2/libsmb2-share-enum.h
+                    include/smb2/smb2.h
+                    include/smb2/smb2-errors.h
+                    include/smb2/smb2-ioctl.h
+            DESTINATION ${INSTALL_INC_DIR}/smb2)
 
       install(FILES cmake/FindSMB2.cmake
                   ${CMAKE_CURRENT_BINARY_DIR}/libsmb2-config-version.cmake

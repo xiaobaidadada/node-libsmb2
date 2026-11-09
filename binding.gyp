@@ -7,7 +7,7 @@
         "src/workers.cpp",
         "src/smb2_server.cpp",
         "<!@(node -p \"require('fs').readdirSync('c-libsmb2/lib').filter(f=>f.endsWith('.c')).map(f=>'c-libsmb2/lib/'+f).join(' ')\")",
-        "<!@(node -p \"const fs=require('fs'),p=require('path');const d='c-libsmb2/libdcerpc';const out=[];(function walk(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){const f=p.join(dir,e.name);if(e.isDirectory()){if(e.name!=='dcerpc'&&e.name!=='examples'&&e.name!=='tests'&&e.name!=='utils'&&e.name!=='dcerpcd'&&e.name!=='packaging')walk(f);}else if(e.name.endsWith('.c'))out.push(f);}})(d);out.join(' ')\")"
+        "<!@(node -p \"const fs=require('fs'),p=require('path');const d='c-libsmb2/libdcerpc';const out=[];(function walk(dir){for(const e of fs.readdirSync(dir,{withFileTypes:true})){const f=p.posix.join(dir,e.name);if(e.isDirectory()){if(e.name!=='dcerpc'&&e.name!=='examples'&&e.name!=='tests'&&e.name!=='utils'&&e.name!=='dcerpcd'&&e.name!=='packaging')walk(f);}else if(e.name.endsWith('.c'))out.push(f);}})(d);out.join(' ')\")"
       ],
       "include_dirs": [
         "node_modules/node-addon-api",
@@ -35,6 +35,9 @@
         [
           "OS==\"win\"",
           {
+            "sources": [
+              "src/compat/win_shim.c"
+            ],
             "defines": [
               "_WINDOWS",
               "_U_=",
@@ -47,6 +50,9 @@
             "msvs_settings": {
               "VCCLCompilerTool": {
                 "ExceptionHandling": 0,
+                "ForcedIncludeFiles": [
+                  "<(module_root_dir)/src/compat/win_net.h"
+                ],
                 "AdditionalOptions": [
                   "/utf-8"
                 ],
